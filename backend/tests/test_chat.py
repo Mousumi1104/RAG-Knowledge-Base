@@ -27,7 +27,8 @@ def test_chat_grounded_answer_with_sources(client) -> None:
         assert s["document"] == LEAVE_POLICY_NAME
         assert isinstance(s["excerpt"], str) and s["excerpt"]
         assert s["document_id"] > 0
-        assert isinstance(s["score"], int | float)
+        # Sources no longer carry a numeric score (M4 source-reference policy).
+        assert "score" not in s
 
 
 def test_chat_empty_query_422(client) -> None:

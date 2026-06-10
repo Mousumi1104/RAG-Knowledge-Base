@@ -2,18 +2,18 @@
 
 import { useCallback, useRef, useState } from "react";
 import ProgressBar from "@/components/ProgressBar";
-import { uploadDocumentWithProgress } from "@/services/api";
+import { getToken, uploadDocumentWithProgress } from "@/services/api";
 
-// Upload lifecycle for the anonymous chat uploader. Mirrors the admin component
-// but uploads WITHOUT a token (the /documents/upload endpoint is public).
+// Upload lifecycle for the chat uploader. Mirrors the admin component.
 type UploadPhase = "idle" | "uploading" | "indexing";
 
 /**
- * Small, unobtrusive upload control for the public chat sidebar.
+ * Small, unobtrusive upload control for the chat sidebar.
  *
- * A visitor can pick a file and upload it WITHOUT logging in (no token is sent).
- * Shows the same determinate progress bar + "Indexing…" indeterminate state as
- * the admin uploader, and a short confirmation on success.
+ * The signed-in user can pick a file and upload it; the current bearer token is
+ * attached (the /documents/upload endpoint now requires authentication). Shows
+ * the same determinate progress bar + "Indexing…" indeterminate state as the
+ * admin uploader, and a short confirmation on success.
  */
 export default function ChatUpload() {
   const [file, setFile] = useState<File | null>(null);
@@ -35,9 +35,9 @@ export default function ChatUpload() {
     setError(null);
     setNotice(null);
     try {
-      // No token: this is the public, anonymous upload path.
       await uploadDocumentWithProgress({
         file,
+        token: getToken(),
         onProgress: (fraction) => {
           setProgress(fraction);
           if (fraction === null || fraction >= 1) {

@@ -33,14 +33,31 @@ class VectorStore(ABC):
         """Upsert vectors with parallel metadata and source documents."""
 
     @abstractmethod
-    def query(self, embedding: list[float], top_k: int) -> list[QueryResult]:
-        """Return the ``top_k`` most similar records, most-relevant first."""
+    def query(
+        self,
+        embedding: list[float],
+        top_k: int,
+        *,
+        owner_id: int | None = None,
+        include_global: bool = True,
+    ) -> list[QueryResult]:
+        """Return the ``top_k`` most similar records, most-relevant first.
+
+        Tenant isolation (DEFAULT-DENY): the candidate set is restricted to
+        records whose document satisfies ``owner_id == <owner_id>`` OR
+        (``include_global`` and the document ``is_global``). There is NO
+        "all documents" fallback: if ``owner_id is None`` and
+        ``include_global is False`` the result set is empty.
+        """
 
     def keyword_query(
         self,
         embedding: list[float],
         terms: list[str],
         top_k: int,
+        *,
+        owner_id: int | None = None,
+        include_global: bool = True,
     ) -> list[QueryResult]:
         """Return up to ``top_k`` records that literally contain any of ``terms``.
 
@@ -49,6 +66,9 @@ class VectorStore(ABC):
         carries its real vector ``score`` (vs. ``embedding``) so callers can blend
         and threshold consistently. Default implementation returns nothing; stores
         that can do a substring scan (e.g. SQL ``ILIKE``) override this.
+
+        The SAME tenant-isolation rule as :meth:`query` applies (DEFAULT-DENY),
+        so the lexical-rescue path can never leak another tenant's chunks.
         """
         return []
 

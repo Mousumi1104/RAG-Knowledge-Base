@@ -1,101 +1,36 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect } from "react";
 import Link from "next/link";
-import { clearToken, isAuthed, login } from "@/services/api";
+import { useRouter } from "next/navigation";
 import AdminDashboard from "@/components/AdminDashboard";
-import DocumentUpload from "@/components/DocumentUpload";
-
-function LoginForm({ onSuccess }: { onSuccess: () => void }) {
-  const [username, setUsername] = useState("admin");
-  const [password, setPassword] = useState("");
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const onSubmit = useCallback(
-    async (e: React.FormEvent) => {
-      e.preventDefault();
-      setSubmitting(true);
-      setError(null);
-      try {
-        await login(username, password);
-        onSuccess();
-      } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
-      } finally {
-        setSubmitting(false);
-      }
-    },
-    [username, password, onSuccess],
-  );
-
-  return (
-    <main className="container">
-      <div className="login-wrap">
-        <form className="card login-card" onSubmit={(e) => void onSubmit(e)}>
-          <h1>Admin Login</h1>
-          <p className="muted">Sign in to manage documents and view the dashboard.</p>
-
-          <label className="login-label" htmlFor="username">
-            Username
-          </label>
-          <input
-            id="username"
-            type="text"
-            value={username}
-            autoComplete="username"
-            onChange={(e) => setUsername(e.target.value)}
-            disabled={submitting}
-          />
-
-          <label className="login-label" htmlFor="password">
-            Password
-          </label>
-          <input
-            id="password"
-            type="password"
-            value={password}
-            autoComplete="current-password"
-            onChange={(e) => setPassword(e.target.value)}
-            disabled={submitting}
-          />
-
-          {error && <p className="error">{error}</p>}
-
-          <button type="submit" disabled={submitting} className="login-submit">
-            {submitting ? "Signing in..." : "Sign in"}
-          </button>
-
-          <p className="login-back">
-            <Link href="/">Back to chat</Link>
-          </p>
-        </form>
-      </div>
-    </main>
-  );
-}
+import AdminDocuments from "@/components/AdminDocuments";
+import UserManagement from "@/components/UserManagement";
+import { useAuth } from "@/components/AuthProvider";
 
 export default function AdminPage() {
-  const [authed, setAuthed] = useState(false);
-  const [ready, setReady] = useState(false);
+  const router = useRouter();
+  const { user, loading, isAdmin, signOut, refresh } = useAuth();
 
+  // Route guard: send anonymous users to login (returning here afterward).
   useEffect(() => {
-    setAuthed(isAuthed());
-    setReady(true);
-  }, []);
+    if (!loading && !user) {
+      router.replace("/login?next=/admin");
+    }
+  }, [loading, user, router]);
 
   const onLogout = useCallback(() => {
-    clearToken();
-    setAuthed(false);
-  }, []);
+    signOut();
+    router.replace("/login");
+  }, [signOut, router]);
 
-  // Used by children when a request 401s (expired token).
+  // A child request 401'd (expired token): re-check the session, which clears
+  // it and bounces to login via the guard above.
   const onAuthError = useCallback(() => {
-    clearToken();
-    setAuthed(false);
-  }, []);
+    void refresh();
+  }, [refresh]);
 
-  if (!ready) {
+  if (loading || !user) {
     return (
       <main className="container">
         <p className="muted">Loading...</p>
@@ -103,8 +38,24 @@ export default function AdminPage() {
     );
   }
 
-  if (!authed) {
-    return <LoginForm onSuccess={() => setAuthed(true)} />;
+  // Authenticated but not an admin → 403 view (no admin UI is rendered).
+  if (!isAdmin) {
+    return (
+      <main className="container">
+        <header className="page-header">
+          <h1>Access denied</h1>
+          <p className="muted">
+            Your account ({user.email}) doesn&apos;t have admin access.
+          </p>
+        </header>
+        <nav className="page-nav">
+          <Link href="/">Back to chat</Link>
+          <button className="secondary" onClick={onLogout}>
+            Log out
+          </button>
+        </nav>
+      </main>
+    );
   }
 
   return (
@@ -116,16 +67,18 @@ export default function AdminPage() {
             <p className="muted">Document management and indexing dashboard.</p>
           </div>
           <nav className="page-nav">
+            <span className="muted api-base">{user.email}</span>
             <Link href="/">Back to chat</Link>
             <button className="secondary" onClick={onLogout}>
-              Logout
+              Log out
             </button>
           </nav>
         </div>
       </header>
 
-      <DocumentUpload />
       <AdminDashboard onAuthError={onAuthError} />
+      <UserManagement onAuthError={onAuthError} />
+      <AdminDocuments onAuthError={onAuthError} />
     </main>
   );
 }

@@ -31,6 +31,11 @@ class DocumentOut(BaseModel):
     filename: str
     document_type: str
     uploaded_by: str | None = None
+    # Tenant ownership. Listing/get routes are owner-scoped server-side, so these
+    # never leak another user's rows; they let the client distinguish own vs.
+    # (admin-managed) global docs. ``owner_id`` is null for global/legacy docs.
+    owner_id: int | None = None
+    is_global: bool = False
     file_path: str
     size: int
     indexing_status: str

@@ -8,7 +8,7 @@ chunk vectors live in the vector store. The model reuses the shared
 
 from __future__ import annotations
 
-from sqlalchemy import BigInteger, Integer, String, Text
+from sqlalchemy import BigInteger, Boolean, ForeignKey, Integer, String, Text, false
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import Base, TimestampStatusMixin
@@ -23,6 +23,17 @@ class Document(Base, TimestampStatusMixin):
     document_type: Mapped[str] = mapped_column(String(16), nullable=False)
     uploaded_by: Mapped[str | None] = mapped_column(
         String(255), nullable=True, default="admin", server_default="admin"
+    )
+    # Owning user. NULL == not user-owned (admin-global or legacy backfilled docs).
+    owner_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", name="fk_documents_owner_id_users"),
+        nullable=True,
+        index=True,
+    )
+    # True == admin-global doc that silently grounds every user's answers.
+    is_global: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
     )
     file_path: Mapped[str] = mapped_column(String(1024), nullable=False)
     size: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)

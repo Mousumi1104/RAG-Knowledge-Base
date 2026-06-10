@@ -200,18 +200,34 @@ def _active_chunk_ids(db: Session, chunk_ids: set[str]) -> set[str]:
     return set(db.execute(stmt).scalars().all())
 
 
-def search(db: Session, query: str, top_k: int | None = None) -> list[dict]:
-    """Run semantic search and return ranked, active-only results.
+def search(
+    db: Session,
+    query: str,
+    top_k: int | None = None,
+    *,
+    owner_id: int | None,
+    include_global: bool = True,
+) -> list[dict]:
+    """Run semantic search and return ranked, active-only, tenant-scoped results.
+
+    Tenant isolation is DEFAULT-DENY and enforced in the vector layer: only
+    chunks whose document is owned by ``owner_id`` OR (when ``include_global``)
+    is an admin-global document are ever candidates. No other tenant's chunk can
+    enter the candidate pool, the keyword-rescue pool, or the results.
 
     Args:
         db: Database session for resolving documents/chunks.
         query: Natural-language query string.
         top_k: Max number of active results to return; defaults to ``settings.TOP_K``.
+        owner_id: The requesting user's id (their own docs are candidates). With
+            ``None`` and ``include_global`` False the candidate set is empty.
+        include_global: Whether admin-global docs may ground the answer.
 
     Returns:
         A list of result dicts, most relevant first, each shaped as::
 
-            {document_id, document_name, excerpt, chunk_id, page, score}
+            {document_id, document_name, excerpt, chunk_id, page, score,
+             owner_id, is_global}
     """
     query = (query or "").strip()
     if not query:
@@ -235,7 +251,9 @@ def search(db: Session, query: str, top_k: int | None = None) -> list[dict]:
     embedding = provider.embed_query(query)
 
     store = _get_vector_store()
-    hits = store.query(embedding, top_k=candidate_k)
+    hits = store.query(
+        embedding, top_k=candidate_k, owner_id=owner_id, include_global=include_global
+    )
     logger.info(
         "Search query=%r returned %s candidate(s) (top_k=%s)",
         query,
@@ -260,7 +278,11 @@ def search(db: Session, query: str, top_k: int | None = None) -> list[dict]:
     if query_words:
         try:
             keyword_hits = store.keyword_query(
-                embedding, sorted(query_words), top_k=candidate_k
+                embedding,
+                sorted(query_words),
+                top_k=candidate_k,
+                owner_id=owner_id,
+                include_global=include_global,
             )
         except Exception as exc:  # noqa: BLE001 - lexical rescue is best-effort
             logger.warning("keyword_query failed (%s); using vector pool only.", exc)
@@ -363,6 +385,10 @@ def search(db: Session, query: str, top_k: int | None = None) -> list[dict]:
                 "chunk_id": chunk_id,
                 "page": page,
                 "score": float(hit.get("score", 0.0)),
+                # Ownership flags (from the authoritative resolved Document row)
+                # so the source builder can apply the own-docs-only display rule.
+                "owner_id": document.owner_id,
+                "is_global": bool(document.is_global),
             }
         )
 

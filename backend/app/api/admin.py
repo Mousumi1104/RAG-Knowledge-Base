@@ -9,8 +9,9 @@ from __future__ import annotations
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from app.core.security import get_current_admin
+from app.core.security import get_current_admin, require_admin
 from app.database.session import get_db
+from app.models.user import User
 from app.schemas.admin import (
     HealthResponse,
     IndexingStatusResponse,
@@ -18,7 +19,8 @@ from app.schemas.admin import (
     ReindexResponse,
     StatsResponse,
 )
-from app.services import admin_service
+from app.schemas.user import UserOut
+from app.services import admin_service, user_service
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -79,3 +81,44 @@ def get_health(db: Session = Depends(get_db)) -> HealthResponse:
     """Check database connectivity and vector-store health."""
     logger.info("GET /admin/health")
     return HealthResponse(**admin_service.health(db))
+
+
+# --- User management ---------------------------------------------------------
+@router.get("/users", response_model=list[UserOut])
+def list_users(db: Session = Depends(get_db)) -> list[User]:
+    """List all non-deleted users (safe ``UserOut`` — never includes hashes)."""
+    logger.info("GET /admin/users")
+    return user_service.list_users(db)
+
+
+@router.post("/users/{user_id}/enable", response_model=UserOut)
+def enable_user(user_id: int, db: Session = Depends(get_db)) -> User:
+    """Re-enable a disabled user (``is_active = True``)."""
+    logger.info("POST /admin/users/%s/enable", user_id)
+    return user_service.set_active(db, user_id, True)
+
+
+@router.post("/users/{user_id}/disable", response_model=UserOut)
+def disable_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+) -> User:
+    """Disable a user (``is_active = False``); an admin cannot disable themselves."""
+    logger.info("POST /admin/users/%s/disable", user_id)
+    if user_id == current_admin.id:
+        raise HTTPException(status_code=400, detail="An admin cannot disable themselves")
+    return user_service.set_active(db, user_id, False)
+
+
+@router.delete("/users/{user_id}", response_model=UserOut)
+def delete_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+) -> User:
+    """Soft-delete a user; an admin cannot delete themselves."""
+    logger.info("DELETE /admin/users/%s", user_id)
+    if user_id == current_admin.id:
+        raise HTTPException(status_code=400, detail="An admin cannot delete themselves")
+    return user_service.delete_user(db, user_id)

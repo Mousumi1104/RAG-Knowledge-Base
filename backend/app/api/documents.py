@@ -14,8 +14,9 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Up
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
-from app.core.security import get_current_admin
+from app.core.security import get_current_admin, get_current_user
 from app.database.session import SessionLocal, get_db
+from app.models.user import User
 from app.schemas.document import (
     DocumentList,
     DocumentOut,
@@ -37,19 +38,34 @@ _MEDIA_TYPES: dict[str, str] = {
     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 }
 
-# Public routes: no authentication. Anonymous upload plus public file serving so
-# the frontend can deep-link to a document (and a #page=N anchor for PDFs).
+# User routes: require an authenticated user (get_current_user). Every route here
+# is tenant-scoped server-side — a user only ever sees/acts on their own documents
+# (admins, resolved via role at request time, act on all). Uploads, the personal
+# library list/get/delete/reindex, and authenticated file serving live here.
+#
+# NOTE: this router is still exported as ``public_router`` for main.py's
+# ``include_router`` call, but it is no longer public — anonymous access is gone.
 public_router = APIRouter(
     prefix="/documents",
     tags=["documents"],
 )
 
-# Management routes require a valid admin JWT.
+# Admin-only management routes (e.g. global uploads) require a valid admin JWT.
 admin_router = APIRouter(
     prefix="/documents",
     tags=["documents"],
     dependencies=[Depends(get_current_admin)],
 )
+
+
+def _owner_scope(current_user: User) -> int | None:
+    """Resolve the document-ownership scope for a request.
+
+    Returns ``None`` for admins (no scope → all documents) and the user's id for
+    everyone else (scope → own documents only). Centralizes the admin-sees-all
+    rule so every route applies it identically.
+    """
+    return None if current_user.role == "admin" else current_user.id
 
 
 def _run_indexing_bg(doc_id: int, *, reindex: bool = False) -> None:
@@ -100,12 +116,14 @@ async def upload_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> DocumentOut:
-    """Publicly upload a document: validate, store, create the row, queue indexing.
+    """Upload a user-owned document: validate, store, create the row, queue indexing.
 
-    This endpoint is intentionally unauthenticated. Uploads are always attributed
-    to ``"anonymous"`` — any client-supplied ``uploaded_by`` is ignored so a caller
-    cannot spoof ``"admin"``.
+    Requires authentication (no more anonymous uploads). The document is owned by
+    the authenticated user (``owner_id = current_user.id``, ``is_global = False``)
+    and attributed to their email. Ownership is set server-side from the token and
+    is never client-controlled.
 
     Size/type validation happens inside ``create_document`` (``validate_upload``)
     *before* the file is stored, so an oversized file is rejected with 413 quickly.
@@ -118,7 +136,9 @@ async def upload_document(
         db,
         upload_file_bytes=contents,
         filename=file.filename or "upload",
-        uploaded_by="anonymous",
+        uploaded_by=current_user.email,
+        owner_id=current_user.id,
+        is_global=False,
     )
     # Snapshot the response payload before the request session closes, then run
     # indexing in the background (own session) so the response returns instantly.
@@ -128,15 +148,25 @@ async def upload_document(
 
 
 @public_router.get("/{doc_id}/file", response_model=None)
-def get_document_file(doc_id: int, db: Session = Depends(get_db)) -> FileResponse | StreamingResponse:
-    """Publicly serve an active document's original file for inline rendering.
+def get_document_file(
+    doc_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> FileResponse | StreamingResponse:
+    """Serve a document's original file for inline rendering (authenticated).
+
+    Requires authentication and enforces ownership server-side: the file is served
+    only if the document is admin-global OR owned by the requesting user (admins
+    may access any). Otherwise a 404 is returned — the same response as a missing
+    doc, so existence of another user's private document is never revealed.
 
     Returns the stored file with the correct media type and an ``inline`` content
     disposition so a browser renders it (and PDF viewers honor ``#page=N`` deep
     links). 404 if the document is missing/deleted or its file is gone from disk.
-    Intentionally unauthenticated.
     """
-    document = document_service.get_document(db, doc_id)
+    document = document_service.get_document(
+        db, doc_id, owner_id=_owner_scope(current_user), allow_global=True
+    )
     if document is None:
         raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
 
@@ -194,40 +224,99 @@ def get_document_file(doc_id: int, db: Session = Depends(get_db)) -> FileRespons
     )
 
 
-# --- Admin (management) routes --------------------------------------------
-@admin_router.get("", response_model=DocumentList)
+# --- Admin-only routes ----------------------------------------------------
+# Global uploads are admin-only and live on a dedicated, unambiguous literal path
+# (``POST /documents/global``) rather than an ``is_global`` flag on the user
+# upload route — that keeps the public upload route incapable of ever minting a
+# global doc (no client-controlled escalation) and makes the admin intent explicit.
+@admin_router.post("/global", response_model=DocumentOut, status_code=201)
+async def upload_global_document(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_admin),
+) -> DocumentOut:
+    """Admin-only: upload a GLOBAL document that grounds every user's answers.
+
+    Sets ``is_global = True`` and ``owner_id = None``. Global docs are searchable
+    by everyone but never appear in any user's personal library or sources list.
+    """
+    contents = await file.read()
+    document = document_service.create_document(
+        db,
+        upload_file_bytes=contents,
+        filename=file.filename or "upload",
+        uploaded_by=current_user.email,
+        owner_id=None,
+        is_global=True,
+    )
+    result = DocumentOut.model_validate(document)
+    background_tasks.add_task(_run_indexing_bg, document.id)
+    return result
+
+
+# --- Document library (management) routes ---------------------------------
+# Authenticated + tenant-scoped: a user manages ONLY their own docs; an admin
+# (resolved via role at request time through ``_owner_scope``) manages all docs.
+# Cross-tenant ids 404 identically to missing ids (no IDOR / existence leak).
+@public_router.get("", response_model=DocumentList)
 def list_documents(
     include_inactive: bool = False,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> DocumentList:
-    """List active documents (DELETED/INACTIVE excluded unless requested)."""
-    documents = document_service.list_documents(db, include_inactive=include_inactive)
+    """List the caller's own documents (admin: all). Personal library excludes globals.
+
+    DELETED/INACTIVE are excluded unless ``include_inactive`` is set. A regular
+    user only ever sees ``owner_id == current_user.id`` rows; admin-global docs are
+    searchable but intentionally not shown in the personal library.
+    """
+    documents = document_service.list_documents(
+        db, include_inactive=include_inactive, owner_id=_owner_scope(current_user)
+    )
     items = [DocumentOut.model_validate(doc) for doc in documents]
     return DocumentList(items=items, total=len(items))
 
 
-@admin_router.get("/{doc_id}", response_model=DocumentOut)
-def get_document(doc_id: int, db: Session = Depends(get_db)) -> DocumentOut:
-    """Fetch one active document (404 if missing/deleted)."""
-    document = document_service.get_document_or_404(db, doc_id)
+@public_router.get("/{doc_id}", response_model=DocumentOut)
+def get_document(
+    doc_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> DocumentOut:
+    """Fetch one of the caller's own documents (404 if missing/deleted/foreign)."""
+    document = document_service.get_document_or_404(
+        db, doc_id, owner_id=_owner_scope(current_user)
+    )
     return DocumentOut.model_validate(document)
 
 
-@admin_router.delete("/{doc_id}", response_model=MessageResponse)
-def delete_document(doc_id: int, db: Session = Depends(get_db)) -> MessageResponse:
-    """Soft-delete a document (status = DELETED) and clean up its vectors."""
-    document_service.soft_delete_document(db, doc_id)
+@public_router.delete("/{doc_id}", response_model=MessageResponse)
+def delete_document(
+    doc_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> MessageResponse:
+    """Soft-delete one of the caller's own documents (admin: any) and drop vectors.
+
+    Users cannot delete admin-global docs; a foreign/global id 404s for a user
+    (no existence leak). Admins (``_owner_scope`` → None) may delete any document.
+    """
+    document_service.soft_delete_document(db, doc_id, owner_id=_owner_scope(current_user))
     return MessageResponse(detail=f"Document {doc_id} deleted")
 
 
-@admin_router.post("/{doc_id}/reindex", response_model=ReindexResponse)
+@public_router.post("/{doc_id}/reindex", response_model=ReindexResponse)
 def reindex_document(
     doc_id: int,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> ReindexResponse:
-    """Reset indexing status to pending and queue reindexing in the background."""
-    document = document_service.set_indexing_status(db, doc_id, status="pending")
+    """Reset indexing to pending and queue reindexing (own docs only; admin: any)."""
+    document = document_service.set_indexing_status(
+        db, doc_id, status="pending", owner_id=_owner_scope(current_user)
+    )
     response = ReindexResponse(
         id=document.id,
         indexing_status=document.indexing_status,

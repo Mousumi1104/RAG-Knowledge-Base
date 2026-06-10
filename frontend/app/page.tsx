@@ -1,45 +1,35 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import ChatHistory from "@/components/ChatHistory";
 import ChatInterface from "@/components/ChatInterface";
 import ChatUpload from "@/components/ChatUpload";
-import { getConversations } from "@/services/api";
+import { useAuth } from "@/components/AuthProvider";
 
 export default function HomePage() {
+  const router = useRouter();
+  const { user, loading, isAdmin, signOut } = useAuth();
+
   // The conversation the thread should display. `null` = a fresh chat.
+  // Per-session each login starts a fresh chat (we no longer auto-load the
+  // most recent conversation); history remains available via the sidebar.
   const [activeId, setActiveId] = useState<number | null>(null);
   // Bumping this re-fetches the sidebar conversation list.
   const [refreshKey, setRefreshKey] = useState(0);
   // Sidebar visibility on narrow screens.
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
+  // Route guard: unauthenticated users go to the login page.
+  useEffect(() => {
+    if (!loading && !user) {
+      router.replace("/login?next=/");
+    }
+  }, [loading, user, router]);
+
   const refreshHistory = useCallback(() => {
     setRefreshKey((k) => k + 1);
-  }, []);
-
-  // Load the most recent persisted conversation on mount (global history).
-  useEffect(() => {
-    let mounted = true;
-    void (async () => {
-      try {
-        const conversations = await getConversations();
-        if (!mounted || conversations.length === 0) {
-          return;
-        }
-        conversations.sort(
-          (a, b) =>
-            new Date(b.last_modified).getTime() - new Date(a.last_modified).getTime(),
-        );
-        setActiveId(conversations[0].id);
-      } catch {
-        // Best-effort: a fresh chat is fine if history can't be loaded.
-      }
-    })();
-    return () => {
-      mounted = false;
-    };
   }, []);
 
   const handleSelect = useCallback((id: number) => {
@@ -67,6 +57,21 @@ export default function HomePage() {
     [refreshHistory],
   );
 
+  const onLogout = useCallback(() => {
+    signOut();
+    router.replace("/login");
+  }, [signOut, router]);
+
+  // While the session resolves (or before redirecting an anon user), avoid
+  // flashing the authenticated UI.
+  if (loading || !user) {
+    return (
+      <main className="container">
+        <p className="muted">Loading...</p>
+      </main>
+    );
+  }
+
   return (
     <div className="chat-shell">
       {sidebarOpen && (
@@ -90,15 +95,26 @@ export default function HomePage() {
           onDeleted={handleDeleted}
         />
 
-        {/* User-facing anonymous upload control. */}
+        {/* User-facing upload control. */}
         <div className="sidebar-slot" data-slot="chat-upload">
           <ChatUpload />
         </div>
 
         <div className="sidebar-footer">
-          <Link href="/admin" className="sidebar-admin-link">
-            Admin
+          <div className="sidebar-user" title={user.email}>
+            <span className="sidebar-user-email">{user.email}</span>
+          </div>
+          <Link href="/library" className="sidebar-admin-link">
+            My documents
           </Link>
+          {isAdmin && (
+            <Link href="/admin" className="sidebar-admin-link">
+              Admin
+            </Link>
+          )}
+          <button type="button" className="secondary sidebar-logout" onClick={onLogout}>
+            Log out
+          </button>
         </div>
       </aside>
 

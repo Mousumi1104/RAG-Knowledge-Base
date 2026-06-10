@@ -190,16 +190,26 @@ def _sanitize_question(question: str) -> str:
     return cleaned
 
 
-def _build_sources(hits: Sequence[Mapping[str, object]]) -> list[dict]:
-    """Shape search hits into API source dicts, deduped by (document, excerpt).
+def _build_sources(hits: Sequence[Mapping[str, object]], owner_id: int) -> list[dict]:
+    """Shape search hits into API source dicts: ONLY the user's OWN documents.
 
-    Keeps every distinct contributing excerpt but drops exact duplicates so a
-    document chunked into near-identical pieces does not flood the source list.
-    The highest-scoring occurrence is retained for each unique excerpt.
+    Source-reference rule (security-relevant): a hit is shown as a source iff it
+    is one of the requesting user's own documents — ``owner_id == <owner_id> AND
+    is_global == False``. Admin-global docs (``is_global == True``) are allowed to
+    ground the answer (they stay in the prompt context built from ``hits``) but
+    are EXCLUDED from the returned sources. If the answer was grounded only on
+    global docs, this returns an empty list.
+
+    Retrieval order (most-relevant first) is preserved. Exact ``(document,
+    excerpt)`` duplicates are dropped. No numeric score is emitted.
     """
     seen: set[tuple[int, str]] = set()
     sources: list[dict] = []
     for hit in hits:
+        # Display only the user's own (non-global) documents.
+        hit_owner_id = hit.get("owner_id")
+        if hit.get("is_global") or hit_owner_id is None or int(hit_owner_id) != int(owner_id):
+            continue
         document_id = int(hit.get("document_id", 0) or 0)
         excerpt = str(hit.get("excerpt") or "")
         key = (document_id, excerpt)
@@ -217,7 +227,6 @@ def _build_sources(hits: Sequence[Mapping[str, object]]) -> list[dict]:
                 "excerpt": excerpt,
                 "document_id": document_id,
                 "page": page,
-                "score": float(hit.get("score", 0.0) or 0.0),
             }
         )
     return sources
@@ -284,11 +293,18 @@ def _derive_title(question: str) -> str:
     return cleaned or "New conversation"
 
 
-def _get_active_conversation(db: Session, conversation_id: int) -> Conversation | None:
-    """Return one ACTIVE conversation by id, or ``None``."""
+def _get_active_conversation(
+    db: Session, conversation_id: int, owner_id: int
+) -> Conversation | None:
+    """Return one ACTIVE conversation owned by ``owner_id`` by id, or ``None``.
+
+    Scoped by ``user_id`` so a user can never resolve/attach to another user's
+    thread (a foreign id is indistinguishable from a missing one).
+    """
     stmt = select(Conversation).where(
         Conversation.id == conversation_id,
         Conversation.status == Status.ACTIVE.value,
+        Conversation.user_id == owner_id,
     )
     return db.execute(stmt).scalars().first()
 
@@ -297,26 +313,45 @@ def resolve_or_create_conversation(
     db: Session,
     conversation_id: int | None,
     question: str,
+    owner_id: int,
 ) -> Conversation:
-    """Resolve an existing ACTIVE conversation or create a new one.
+    """Resolve an existing ACTIVE conversation (owned by ``owner_id``) or create one.
 
-    When ``conversation_id`` is given and refers to an ACTIVE conversation it is
-    reused; otherwise (omitted, null, or not found) a new conversation is created
-    with a title derived from ``question``. Commits so the id is available.
+    When ``conversation_id`` refers to an ACTIVE conversation OWNED BY ``owner_id``
+    it is reused; otherwise (omitted, null, not found, or owned by another user) a
+    new conversation is created with ``user_id = owner_id`` and a title derived
+    from ``question``. Commits so the id is available. Never attaches to another
+    user's thread.
     """
     if conversation_id is not None:
-        conversation = _get_active_conversation(db, conversation_id)
+        conversation = _get_active_conversation(db, conversation_id, owner_id)
         if conversation is not None:
             return conversation
         logger.info(
-            "conversation_id=%s not found/inactive; creating a new conversation.",
+            "conversation_id=%s not found/inactive/foreign; creating a new conversation.",
             conversation_id,
         )
 
-    conversation = Conversation(title=_derive_title(question))
+    conversation = Conversation(title=_derive_title(question), user_id=owner_id)
     db.add(conversation)
     db.commit()
     db.refresh(conversation)
+    return conversation
+
+
+def create_conversation(db: Session, owner_id: int, title: str | None = None) -> Conversation:
+    """Create a fresh empty conversation owned by ``owner_id`` and return it.
+
+    Used by the explicit ``POST /chat/conversations`` endpoint so the client can
+    start a brand-new chat (e.g. on login/session start) and receive its unique
+    id up front, before the first message. ``user_id`` is always set to
+    ``owner_id`` so the new thread belongs to the caller and to no one else.
+    """
+    conversation = Conversation(title=_derive_title(title or ""), user_id=owner_id)
+    db.add(conversation)
+    db.commit()
+    db.refresh(conversation)
+    logger.info("Created conversation id=%s for user_id=%s", conversation.id, owner_id)
     return conversation
 
 
@@ -365,13 +400,18 @@ def _retrieve_and_build_prompt(
     cleaned_question: str,
     top_k: int | None,
     history: Sequence[Mapping[str, str]] | None,
+    owner_id: int,
 ) -> tuple[str, str, list[dict]]:
-    """Retrieve context and build the grounded prompt.
+    """Retrieve tenant-scoped context and build the grounded prompt.
 
-    Returns ``(system, user, sources)``. ``sources`` is empty when no context is
-    retrieved (the prompt still instructs the model to disclaim).
+    Retrieval is restricted (DEFAULT-DENY) to the user's own docs + admin-global
+    docs. ``relevant`` (the prompt context) may include global docs that ground
+    the answer; ``_build_sources`` then keeps ONLY the user's own docs as visible
+    sources. Returns ``(system, user, sources)``.
     """
-    hits = search_service.search(db, query=cleaned_question, top_k=top_k)
+    hits = search_service.search(
+        db, query=cleaned_question, top_k=top_k, owner_id=owner_id, include_global=True
+    )
     relevant = [
         hit for hit in hits if float(hit.get("score", 0.0) or 0.0) >= _MIN_RELEVANCE_SCORE
     ]
@@ -382,29 +422,41 @@ def _retrieve_and_build_prompt(
         len(relevant),
     )
     system, user = build_rag_prompt(cleaned_question, relevant, history=history)
-    return system, user, _build_sources(relevant)
+    return system, user, _build_sources(relevant, owner_id)
 
 
-def list_conversations(db: Session) -> list[Conversation]:
-    """Return ACTIVE conversations, newest first."""
+def list_conversations(db: Session, owner_id: int) -> list[Conversation]:
+    """Return the user's own ACTIVE conversations, newest first."""
     stmt = (
         select(Conversation)
-        .where(Conversation.status == Status.ACTIVE.value)
+        .where(
+            Conversation.status == Status.ACTIVE.value,
+            Conversation.user_id == owner_id,
+        )
         .order_by(Conversation.last_modified.desc(), Conversation.id.desc())
     )
     return list(db.execute(stmt).scalars().all())
 
 
-def get_conversation_or_404(db: Session, conversation_id: int) -> Conversation:
-    """Return one ACTIVE conversation or raise :class:`NotFoundError`."""
-    conversation = _get_active_conversation(db, conversation_id)
+def get_conversation_or_404(db: Session, conversation_id: int, owner_id: int) -> Conversation:
+    """Return one of the user's own ACTIVE conversations or raise :class:`NotFoundError`.
+
+    A conversation owned by another user 404s identically to a missing one (no
+    existence leak).
+    """
+    conversation = _get_active_conversation(db, conversation_id, owner_id)
     if conversation is None:
         raise NotFoundError(f"Conversation {conversation_id} not found")
     return conversation
 
 
 def get_conversation_messages(db: Session, conversation_id: int) -> list[Message]:
-    """Return ACTIVE messages of a conversation in chronological (id ASC) order."""
+    """Return ACTIVE messages of a conversation in chronological (id ASC) order.
+
+    Callers MUST first establish ownership of ``conversation_id`` (e.g. via
+    :func:`get_conversation_or_404`) so messages are only ever read for a
+    conversation the user owns.
+    """
     stmt = (
         select(Message)
         .where(
@@ -416,9 +468,9 @@ def get_conversation_messages(db: Session, conversation_id: int) -> list[Message
     return list(db.execute(stmt).scalars().all())
 
 
-def soft_delete_conversation(db: Session, conversation_id: int) -> Conversation:
-    """Soft-delete a conversation (and its messages); raises 404 if missing."""
-    conversation = get_conversation_or_404(db, conversation_id)
+def soft_delete_conversation(db: Session, conversation_id: int, owner_id: int) -> Conversation:
+    """Soft-delete one of the user's own conversations (and its messages); 404 if missing."""
+    conversation = get_conversation_or_404(db, conversation_id, owner_id)
     conversation.status = Status.DELETED.value
     db.add(conversation)
     for message in get_conversation_messages(db, conversation_id):
@@ -434,12 +486,16 @@ def stream_answer(
     top_k: int | None = None,
     history: Sequence[Mapping[str, str]] | None = None,
     conversation_id: int | None = None,
+    *,
+    owner_id: int,
 ) -> Iterator[tuple[str, object]]:
     """Stream a grounded answer while persisting the conversation turn.
 
     Owns its OWN ``SessionLocal()`` session (the request-scoped ``get_db``
-    session is closed before a ``StreamingResponse`` body runs). Resolves/creates
-    the conversation and persists the user message before streaming, then
+    session is closed before a ``StreamingResponse`` body runs). ``owner_id`` is
+    passed as a plain int (NOT an ORM ``User``) across that session boundary; it
+    scopes both retrieval (own + global docs) and the conversation. Resolves/
+    creates the conversation and persists the user message before streaming, then
     persists the assistant message after streaming.
 
     Yields tuples the API layer turns into SSE frames:
@@ -451,7 +507,9 @@ def stream_answer(
     db = SessionLocal()
     try:
         cleaned = _sanitize_question(question)
-        conversation = resolve_or_create_conversation(db, conversation_id, cleaned or question)
+        conversation = resolve_or_create_conversation(
+            db, conversation_id, cleaned or question, owner_id
+        )
         conv_id = conversation.id
 
         if not cleaned:
@@ -496,7 +554,9 @@ def stream_answer(
         else:
             effective_history = history
 
-        system, user, sources = _retrieve_and_build_prompt(db, cleaned, top_k, effective_history)
+        system, user, sources = _retrieve_and_build_prompt(
+            db, cleaned, top_k, effective_history, owner_id
+        )
 
         chunks: list[str] = []
         for delta in _stream_answer_deltas(system, user):
@@ -536,6 +596,8 @@ def query(
     top_k: int | None = None,
     history: Sequence[Mapping[str, str]] | None = None,
     conversation_id: int | None = None,
+    *,
+    owner_id: int,
 ) -> dict:
     """Answer ``question`` with RAG over indexed documents and persist the turn.
 
@@ -546,15 +608,20 @@ def query(
         history: Optional prior conversation turns for follow-up support.
         conversation_id: Optional existing conversation to continue; a new one is
             created when omitted/null or not found.
+        owner_id: The requesting user's id. Scopes retrieval (DEFAULT-DENY: own +
+            admin-global docs only) and the conversation it is persisted to.
 
     Returns:
         ``{"answer", "sources", "conversation_id", "message_id"}`` where each
-        source is ``{document, excerpt, document_id, page, score}``. When nothing
-        relevant is found, ``sources`` is empty and the answer says so. The turn
-        (user + assistant messages) is persisted to the resolved conversation.
+        source is ``{document, excerpt, document_id, page}`` (no score) and is one
+        of the user's OWN documents. When nothing relevant is found, ``sources``
+        is empty and the answer says so. The turn (user + assistant messages) is
+        persisted to the resolved conversation.
     """
     cleaned = _sanitize_question(question)
-    conversation = resolve_or_create_conversation(db, conversation_id, cleaned or question)
+    conversation = resolve_or_create_conversation(
+        db, conversation_id, cleaned or question, owner_id
+    )
     conv_id = conversation.id
 
     if not cleaned:
@@ -586,7 +653,9 @@ def query(
     else:
         effective_history = history
 
-    system, user, sources = _retrieve_and_build_prompt(db, cleaned, top_k, effective_history)
+    system, user, sources = _retrieve_and_build_prompt(
+        db, cleaned, top_k, effective_history, owner_id
+    )
     answer = _generate_answer(system, user)
 
     # The answer disclaims having found anything: drop sources so we don't

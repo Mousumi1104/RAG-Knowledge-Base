@@ -193,15 +193,17 @@ def anon_client():
 def _login_admin(test_client) -> str:
     """POST form-encoded admin creds to ``/auth/login`` and return the token.
 
-    Credentials come from the *live* app settings (``get_settings()``) so this
-    tracks the dev defaults (``admin`` / ``admin123``) without duplicating them.
+    Login is by email now: the seeded admin user logs in with ``ADMIN_EMAIL`` in
+    the OAuth2 ``username`` field. Credentials come from the *live* app settings
+    (``get_settings()``) so this tracks the dev defaults (``admin@local`` /
+    ``admin123``) without duplicating them.
     """
     from app.core.config import get_settings
 
     creds = get_settings()
     resp = test_client.post(
         "/auth/login",
-        data={"username": creds.ADMIN_USERNAME, "password": creds.ADMIN_PASSWORD},
+        data={"username": creds.ADMIN_EMAIL, "password": creds.ADMIN_PASSWORD},
     )
     assert (
         resp.status_code == 200

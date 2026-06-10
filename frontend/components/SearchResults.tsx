@@ -66,7 +66,6 @@ export default function SearchResults() {
                 title={r.excerpt}
               >
                 <span className="source-link-label">{r.document_name}</span>
-                <span className="source-link-score">{r.score.toFixed(3)}</span>
               </a>
               <p className="excerpt">{r.excerpt}</p>
             </li>

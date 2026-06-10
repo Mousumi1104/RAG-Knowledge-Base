@@ -7,10 +7,26 @@
 export const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 
 // ---------------------------------------------------------------------------
-// Auth (single-admin JWT bearer)
+// Auth (multi-tenant JWT bearer)
 // ---------------------------------------------------------------------------
 
+// Token storage key. Kept as `admin_token` for backward-compatibility with any
+// already-logged-in admin sessions; it now holds the per-user token.
 const TOKEN_KEY = "admin_token";
+
+/** Current authenticated user (mirrors backend UserOut: {id, email, role}). */
+export interface CurrentUser {
+  id: number;
+  email: string;
+  role: "user" | "admin" | string;
+}
+
+/** In-memory cache of the current user, hydrated from GET /auth/me. */
+let cachedUser: CurrentUser | null = null;
+
+export function getCachedUser(): CurrentUser | null {
+  return cachedUser;
+}
 
 /** Thrown when an authed request fails authentication (401). */
 export class AuthError extends Error {
@@ -35,6 +51,7 @@ export function setToken(token: string): void {
 }
 
 export function clearToken(): void {
+  cachedUser = null;
   if (typeof window === "undefined") {
     return;
   }
@@ -54,12 +71,14 @@ export interface LoginResponse {
  * Authenticate against the backend OAuth2 password flow.
  *
  * The backend expects `application/x-www-form-urlencoded` fields `username` and
- * `password` (FastAPI `OAuth2PasswordRequestForm`). On success the access token
- * is stored in localStorage under `admin_token` and returned.
+ * `password` (FastAPI `OAuth2PasswordRequestForm`). The user's email is sent as
+ * the `username` field. On success the access token is stored in localStorage
+ * and returned. Callers should follow up with {@link getMe} to hydrate the
+ * current-user cache.
  */
-export async function login(username: string, password: string): Promise<LoginResponse> {
+export async function login(email: string, password: string): Promise<LoginResponse> {
   const form = new URLSearchParams();
-  form.append("username", username);
+  form.append("username", email);
   form.append("password", password);
   const res = await fetch(`${API_BASE_URL}/auth/login`, {
     method: "POST",
@@ -68,7 +87,30 @@ export async function login(username: string, password: string): Promise<LoginRe
   });
   const data = await handleJson<LoginResponse>(res);
   setToken(data.access_token);
+  cachedUser = null;
   return data;
+}
+
+/**
+ * Register a new account.
+ *
+ * POSTs JSON `{email, password}` to `/auth/register`. The backend returns the
+ * created {@link CurrentUser} (409 on duplicate email, 403 when registration is
+ * disabled). Registration does NOT log the user in — callers should follow with
+ * {@link login}.
+ */
+export async function register(email: string, password: string): Promise<CurrentUser> {
+  const res = await fetch(`${API_BASE_URL}/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  return handleJson<CurrentUser>(res);
+}
+
+/** Clear the stored token and cached user (client-side logout). */
+export function logout(): void {
+  clearToken();
 }
 
 /**
@@ -101,11 +143,28 @@ export interface DocumentOut {
   filename: string;
   document_type: string;
   uploaded_by: string | null;
+  // Tenant ownership. `owner_id` is null for global/legacy docs; `is_global`
+  // marks an admin-uploaded doc that grounds every user's answers but never
+  // appears in a user's personal library.
+  owner_id: number | null;
+  is_global: boolean;
   file_path: string;
   size: number;
   indexing_status: string;
   chunk_count: number;
   error: string | null;
+}
+
+/**
+ * Safe public representation of a user (mirrors backend UserOut: {id, email,
+ * role}). `is_active` is optional because the backend `UserOut` schema may omit
+ * it; the admin UI renders it defensively when present.
+ */
+export interface UserOut {
+  id: number;
+  email: string;
+  role: "user" | "admin" | string;
+  is_active?: boolean;
 }
 
 export interface DocumentList {
@@ -463,7 +522,7 @@ export async function search(query: string, topK?: number): Promise<SearchRespon
   if (typeof topK === "number") {
     body.top_k = topK;
   }
-  const res = await fetch(`${API_BASE_URL}/search`, {
+  const res = await authedFetch(`/search`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -489,7 +548,7 @@ export async function chatQuery(
   if (history && history.length > 0) {
     body.history = history;
   }
-  const res = await fetch(`${API_BASE_URL}/chat/query`, {
+  const res = await authedFetch(`/chat/query`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -565,14 +624,20 @@ export async function streamChat(params: StreamChatParams): Promise<void> {
     body.conversation_id = conversationId;
   }
 
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Accept: "text/event-stream",
+  };
+  const token = getToken();
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+
   let res: Response;
   try {
     res = await fetch(`${API_BASE_URL}/chat/stream`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "text/event-stream",
-      },
+      headers,
       body: JSON.stringify(body),
       signal,
     });
@@ -581,6 +646,11 @@ export async function streamChat(params: StreamChatParams): Promise<void> {
     return;
   }
 
+  if (res.status === 401) {
+    clearToken();
+    onError("Your session has expired. Please sign in again.");
+    return;
+  }
   if (!res.ok) {
     onError(await extractError(res));
     return;
@@ -627,7 +697,7 @@ export async function streamChat(params: StreamChatParams): Promise<void> {
 // ---------------------------------------------------------------------------
 
 export async function getConversations(): Promise<ConversationSummary[]> {
-  const res = await fetch(`${API_BASE_URL}/chat/conversations`, {
+  const res = await authedFetch(`/chat/conversations`, {
     method: "GET",
     cache: "no-store",
   });
@@ -635,8 +705,23 @@ export async function getConversations(): Promise<ConversationSummary[]> {
   return data.items;
 }
 
+/**
+ * Create a fresh conversation for the current user and return its summary.
+ *
+ * Used to start a new chat on login. The backend assigns an id and scopes the
+ * conversation to the authenticated user.
+ */
+export async function createConversation(): Promise<ConversationSummary> {
+  const res = await authedFetch(`/chat/conversations`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+  return handleJson<ConversationSummary>(res);
+}
+
 export async function getConversation(id: number): Promise<ConversationDetail> {
-  const res = await fetch(`${API_BASE_URL}/chat/conversations/${id}`, {
+  const res = await authedFetch(`/chat/conversations/${id}`, {
     method: "GET",
     cache: "no-store",
   });
@@ -644,7 +729,7 @@ export async function getConversation(id: number): Promise<ConversationDetail> {
 }
 
 export async function deleteConversation(id: number): Promise<void> {
-  const res = await fetch(`${API_BASE_URL}/chat/conversations/${id}`, {
+  const res = await authedFetch(`/chat/conversations/${id}`, {
     method: "DELETE",
   });
   await handleJson<MessageResponse>(res);
@@ -654,9 +739,16 @@ export async function deleteConversation(id: number): Promise<void> {
 // Admin (all protected via authedFetch)
 // ---------------------------------------------------------------------------
 
-export async function getMe(): Promise<{ username: string }> {
+/**
+ * Fetch the current authenticated user (id, email, role) and cache it.
+ *
+ * Throws {@link AuthError} on 401 (handled by {@link authedFetch}).
+ */
+export async function getMe(): Promise<CurrentUser> {
   const res = await authedFetch(`/auth/me`, { method: "GET", cache: "no-store" });
-  return handleJson<{ username: string }>(res);
+  const user = await handleJson<CurrentUser>(res);
+  cachedUser = user;
+  return user;
 }
 
 export async function getStats(): Promise<AdminStats> {
@@ -672,6 +764,115 @@ export async function getIndexingStatus(): Promise<IndexingStatus> {
 export async function getAdminHealth(): Promise<AdminHealth> {
   const res = await authedFetch(`/admin/health`, { method: "GET", cache: "no-store" });
   return handleJson<AdminHealth>(res);
+}
+
+// --- Admin: user management -------------------------------------------------
+
+/** List all (non-deleted) users. Admin-only on the backend (require_admin). */
+export async function listAllUsers(): Promise<UserOut[]> {
+  const res = await authedFetch(`/admin/users`, { method: "GET", cache: "no-store" });
+  return handleJson<UserOut[]>(res);
+}
+
+/** Re-enable a disabled user (is_active = true). Returns the updated user. */
+export async function enableUser(id: number): Promise<UserOut> {
+  const res = await authedFetch(`/admin/users/${id}/enable`, { method: "POST" });
+  return handleJson<UserOut>(res);
+}
+
+/**
+ * Disable a user (is_active = false). The backend rejects an admin disabling
+ * themselves with a 400; the thrown Error carries that detail message.
+ */
+export async function disableUser(id: number): Promise<UserOut> {
+  const res = await authedFetch(`/admin/users/${id}/disable`, { method: "POST" });
+  return handleJson<UserOut>(res);
+}
+
+/**
+ * Soft-delete a user. The backend rejects an admin deleting themselves with a
+ * 400; the thrown Error carries that detail message.
+ */
+export async function deleteUser(id: number): Promise<UserOut> {
+  const res = await authedFetch(`/admin/users/${id}`, { method: "DELETE" });
+  return handleJson<UserOut>(res);
+}
+
+// --- Admin: global documents ------------------------------------------------
+
+/**
+ * Admin-only: upload a GLOBAL document (POST /documents/global) that grounds
+ * every user's answers. Delegates to the progress-capable uploader so callers
+ * can drive a progress bar; the current bearer token is attached.
+ */
+export async function uploadGlobalDocument({
+  file,
+  onProgress,
+}: {
+  file: File;
+  onProgress?: (fraction: number | null) => void;
+}): Promise<DocumentOut> {
+  const token = getToken();
+  const attempt = (): Promise<DocumentOut> =>
+    new Promise<DocumentOut>((resolve, reject) => {
+      onProgress?.(0);
+      const form = new FormData();
+      form.append("file", file);
+
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", `${API_BASE_URL}/documents/global`);
+      if (token) {
+        xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+      }
+      xhr.upload.onprogress = (e: ProgressEvent) => {
+        onProgress?.(e.lengthComputable ? e.loaded / e.total : null);
+      };
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            resolve(JSON.parse(xhr.responseText) as DocumentOut);
+          } catch (e) {
+            reject(e instanceof Error ? e : new Error(String(e)));
+          }
+          return;
+        }
+        if (xhr.status === 502 || xhr.status === 503 || xhr.status === 504) {
+          reject({ retryable: true });
+          return;
+        }
+        reject({
+          retryable: false,
+          message: extractErrorFromText(xhr.responseText, xhr.status, xhr.statusText),
+        });
+      };
+      xhr.onerror = () => reject({ retryable: true });
+      xhr.send(form);
+    });
+
+  const isRetryable = (e: unknown): boolean =>
+    typeof e === "object" && e !== null && (e as { retryable?: unknown }).retryable === true;
+
+  const maxAttempts = 3;
+  const backoffs = [2000, 4000];
+
+  for (let i = 0; i < maxAttempts; i++) {
+    await warmUpBackend();
+    try {
+      return await attempt();
+    } catch (e) {
+      if (!isRetryable(e)) {
+        const message = (e as { message?: unknown }).message;
+        throw new Error(typeof message === "string" ? message : String(e));
+      }
+      if (i < maxAttempts - 1) {
+        await new Promise((r) => setTimeout(r, backoffs[i] ?? 4000));
+      }
+    }
+  }
+
+  throw new Error(
+    "Could not reach the server — it may be waking up (free tier). Please try again in a moment.",
+  );
 }
 
 export async function triggerReindex(documentId?: number): Promise<MessageResponse> {

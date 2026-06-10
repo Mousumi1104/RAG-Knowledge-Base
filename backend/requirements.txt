@@ -6,6 +6,8 @@ sqlalchemy>=2.0
 alembic
 python-multipart
 PyJWT>=2.8
+bcrypt
+email-validator
 psycopg[binary]>=3.1
 pgvector>=0.2.5
 pypdf

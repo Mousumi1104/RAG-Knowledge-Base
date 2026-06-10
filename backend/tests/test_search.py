@@ -21,13 +21,10 @@ def test_search_returns_relevant_results(client) -> None:
     for r in results:
         assert r["document_name"] == LEAVE_POLICY_NAME
         assert isinstance(r["excerpt"], str) and r["excerpt"]
-        assert isinstance(r["score"], int | float)
+        # Results no longer carry a numeric score (M4 policy); ranking is by order.
+        assert "score" not in r
         assert r["document_id"] > 0
         assert r["chunk_id"]
-
-    # Results must be ordered by score descending.
-    scores = [r["score"] for r in results]
-    assert scores == sorted(scores, reverse=True)
 
 
 def test_search_respects_top_k(client) -> None:

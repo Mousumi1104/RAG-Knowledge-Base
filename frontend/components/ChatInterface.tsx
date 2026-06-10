@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getConversation, streamChat, type ChatSource } from "@/services/api";
 import Sources from "@/components/Sources";
+import Markdown from "@/components/Markdown";
 
 interface ChatTurn {
   role: "user" | "assistant";
@@ -254,7 +255,11 @@ export default function ChatInterface({
                     </div>
                   ) : (
                     <div className="bubble-content">
-                      {turn.content}
+                      {turn.role === "assistant" ? (
+                        <Markdown content={turn.content} />
+                      ) : (
+                        turn.content
+                      )}
                       {streaming && isLast && turn.role === "assistant" && (
                         <span className="stream-cursor" aria-hidden="true" />
                       )}

@@ -71,7 +71,8 @@ def test_stream_yields_deltas_and_done_frame(client) -> None:
         assert s["document"] == LEAVE_POLICY_NAME
         assert isinstance(s["excerpt"], str) and s["excerpt"]
         assert s["document_id"] > 0
-        assert isinstance(s["score"], int | float)
+        # Sources no longer carry a numeric score (M4 source-reference policy).
+        assert "score" not in s
 
 
 # ---------------------------------------------------------------------------

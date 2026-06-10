@@ -15,7 +15,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import Integer, func, or_, select, text, update
+from sqlalchemy import Integer, false, func, or_, select, text, update
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.core.config import settings
 from app.database.base import Status
@@ -27,6 +28,26 @@ from app.utils.logging import get_logger
 from app.vectorstore.base import QueryResult, VectorStore
 
 logger = get_logger(__name__)
+
+
+def _ownership_clause(owner_id: int | None, include_global: bool) -> ColumnElement[bool]:
+    """Build the DEFAULT-DENY tenant-isolation WHERE clause for a retrieval.
+
+    A candidate chunk's document is allowed iff it is owned by ``owner_id`` OR
+    (when ``include_global``) it is an admin-global document. There is NO
+    "all documents" fallback: if ``owner_id is None`` and ``include_global`` is
+    False this returns a literal ``false`` so the result set is empty (a missing
+    scope must never silently leak every tenant's chunks).
+    """
+    clauses: list[ColumnElement[bool]] = []
+    if owner_id is not None:
+        clauses.append(Document.owner_id == owner_id)
+    if include_global:
+        clauses.append(Document.is_global.is_(True))
+    if not clauses:
+        # Default-deny: no owner scope and globals excluded -> match nothing.
+        return false()
+    return or_(*clauses)
 
 
 class PgVectorStore(VectorStore):
@@ -64,12 +85,24 @@ class PgVectorStore(VectorStore):
             logger.error("pgvector add failed: %s", exc)
             raise ProviderError("Vector store add failed") from exc
 
-    def query(self, embedding: list[float], top_k: int) -> list[QueryResult]:
+    def query(
+        self,
+        embedding: list[float],
+        top_k: int,
+        *,
+        owner_id: int | None = None,
+        include_global: bool = True,
+    ) -> list[QueryResult]:
         """Return up to ``top_k`` most-similar ACTIVE chunks, best first.
 
         Cosine similarity via the ``<=>`` operator; only ACTIVE chunks belonging
         to ACTIVE documents with a non-null embedding are considered. Score is
         ``1.0 - distance`` to match the expected similarity-score semantics.
+
+        Tenant isolation is enforced in SQL (DEFAULT-DENY): only chunks whose
+        document is owned by ``owner_id`` OR (when ``include_global``) is an
+        admin-global document are candidates. With ``owner_id is None`` and
+        ``include_global is False`` the result set is empty.
         """
         if top_k <= 0:
             return []
@@ -83,6 +116,8 @@ class PgVectorStore(VectorStore):
                         Chunk.position,
                         Chunk.page,
                         Chunk.content,
+                        Document.owner_id,
+                        Document.is_global,
                         distance,
                     )
                     .join(Document, Document.id == Chunk.document_id)
@@ -90,6 +125,7 @@ class PgVectorStore(VectorStore):
                         Chunk.embedding.isnot(None),
                         Chunk.status == Status.ACTIVE.value,
                         Document.status == Status.ACTIVE.value,
+                        _ownership_clause(owner_id, include_global),
                     )
                     .order_by(distance.asc())
                     .limit(top_k)
@@ -100,7 +136,7 @@ class PgVectorStore(VectorStore):
             raise ProviderError("Vector store query failed") from exc
 
         results: list[QueryResult] = []
-        for chunk_id, document_id, position, page, content, dist in rows:
+        for chunk_id, document_id, position, page, content, doc_owner_id, doc_is_global, dist in rows:
             results.append(
                 QueryResult(
                     id=str(chunk_id),
@@ -112,6 +148,8 @@ class PgVectorStore(VectorStore):
                         "position": int(position),
                         "page": int(page) if page is not None else None,
                         "content": content or "",
+                        "owner_id": int(doc_owner_id) if doc_owner_id is not None else None,
+                        "is_global": bool(doc_is_global),
                     },
                     document=content or "",
                 )
@@ -124,6 +162,9 @@ class PgVectorStore(VectorStore):
         embedding: list[float],
         terms: list[str],
         top_k: int,
+        *,
+        owner_id: int | None = None,
+        include_global: bool = True,
     ) -> list[QueryResult]:
         """Return up to ``top_k`` ACTIVE chunks literally containing any ``term``.
 
@@ -133,6 +174,9 @@ class PgVectorStore(VectorStore):
         the caller can blend/threshold it exactly like a vector hit. This rescues
         exact terms (e.g. a "transpose" definition) that the IDF-free embedder
         ranks far below the vector top_k.
+
+        The SAME DEFAULT-DENY tenant-isolation clause as :meth:`query` is applied,
+        so this lexical-rescue path can never surface another tenant's chunks.
         """
         cleaned = [t.strip() for t in terms if t and t.strip()]
         if top_k <= 0 or not cleaned:
@@ -158,6 +202,8 @@ class PgVectorStore(VectorStore):
                         Chunk.position,
                         Chunk.page,
                         Chunk.content,
+                        Document.owner_id,
+                        Document.is_global,
                         distance,
                     )
                     .join(Document, Document.id == Chunk.document_id)
@@ -165,6 +211,7 @@ class PgVectorStore(VectorStore):
                         Chunk.embedding.isnot(None),
                         Chunk.status == Status.ACTIVE.value,
                         Document.status == Status.ACTIVE.value,
+                        _ownership_clause(owner_id, include_global),
                         or_(*like_clauses),
                     )
                     .order_by(match_count.desc(), distance.asc())
@@ -176,7 +223,7 @@ class PgVectorStore(VectorStore):
             raise ProviderError("Vector store keyword query failed") from exc
 
         results: list[QueryResult] = []
-        for chunk_id, document_id, position, page, content, dist in rows:
+        for chunk_id, document_id, position, page, content, doc_owner_id, doc_is_global, dist in rows:
             results.append(
                 QueryResult(
                     id=str(chunk_id),
@@ -187,6 +234,8 @@ class PgVectorStore(VectorStore):
                         "position": int(position),
                         "page": int(page) if page is not None else None,
                         "content": content or "",
+                        "owner_id": int(doc_owner_id) if doc_owner_id is not None else None,
+                        "is_global": bool(doc_is_global),
                     },
                     document=content or "",
                 )

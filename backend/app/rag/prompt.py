@@ -45,7 +45,15 @@ _SYSTEM_PROMPT = (
     "return window is not specified.\n"
     "- Be concise and accurate.\n"
     "- When you use the context, cite the source document name(s), e.g. "
-    "(Source: HR_Policy.pdf)."
+    "(Source: HR_Policy.pdf).\n"
+    "- Formatting: write answers in Markdown. Use bullet or numbered lists for "
+    "enumerations, Markdown tables for tabular/comparative data, `**bold**` for "
+    "emphasis and fenced code blocks for code or commands. Render all "
+    "mathematics, formulas, scientific notation and chemical formulas with LaTeX: "
+    "use `$...$` for inline math and `$$...$$` for display math, including "
+    "subscripts and superscripts (e.g. water as $H_2O$, a cube as $x^3$, and one "
+    "nanometre as $10^{-9}\\,\\text{m}$). Do not wrap the whole answer in a code "
+    "block, and keep formatting purposeful rather than decorative."
 )
 
 _NO_CONTEXT_NOTE = (

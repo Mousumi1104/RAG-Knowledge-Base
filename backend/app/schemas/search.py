@@ -26,10 +26,12 @@ class SearchRequest(BaseModel):
 
 
 class SearchResult(BaseModel):
-    """A single ranked search hit.
+    """A single ranked search hit (most-relevant first; no numeric score exposed).
 
-    Mirrors the REQUIREMENTS Search Response (``document_name``, ``excerpt``,
-    ``score``) and adds traceable identifiers (``document_id``, ``chunk_id``).
+    Mirrors the REQUIREMENTS Search Response (``document_name``, ``excerpt``) and
+    adds traceable identifiers (``document_id``, ``chunk_id``). Results are
+    tenant-scoped (own + admin-global) and, like chat sources, carry no numeric
+    similarity score. Ranking is conveyed purely by list order.
     """
 
     document_id: int = Field(..., description="Id of the source document.")
@@ -40,7 +42,6 @@ class SearchResult(BaseModel):
         default=None,
         description="1-based source page the chunk came from (null if unknown).",
     )
-    score: float = Field(..., description="Similarity score (higher is more relevant).")
 
 
 class SearchResponse(BaseModel):

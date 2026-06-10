@@ -2,7 +2,8 @@
 
 The response mirrors the REQUIREMENTS/README example shape
 ``{answer, sources: [{document, excerpt}]}`` and augments each source with
-traceable identifiers (``document_id``, ``score``).
+traceable identifiers (``document_id``, ``page``). Sources carry NO numeric
+score and list only the requesting user's own documents.
 """
 
 from __future__ import annotations
@@ -44,7 +45,12 @@ class ChatRequest(BaseModel):
 
 
 class Source(BaseModel):
-    """A traceable source reference contributing to the answer."""
+    """A traceable source reference contributing to the answer.
+
+    Only the requesting user's OWN documents are surfaced as sources (admin-global
+    docs may ground the answer but are never listed). No numeric similarity score
+    is exposed.
+    """
 
     document: str = Field(..., description="Source document filename.")
     excerpt: str = Field(..., description="The grounding excerpt from the document.")
@@ -53,7 +59,6 @@ class Source(BaseModel):
         default=None,
         description="1-based source page the excerpt came from (null if unknown).",
     )
-    score: float = Field(..., description="Similarity score of the contributing chunk.")
 
 
 class ChatResponse(BaseModel):

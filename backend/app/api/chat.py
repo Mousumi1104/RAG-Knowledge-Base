@@ -6,6 +6,7 @@ delegate the RAG pipeline to ``chat_service``, and shape the JSON response.
 Endpoints:
 - ``POST /chat/query``  — non-streaming answer (back-compat) + persistence.
 - ``POST /chat/stream`` — Server-Sent-Events token stream + persistence.
+- ``POST /chat/conversations``       — start a fresh empty conversation.
 - ``GET  /chat/conversations``       — list ACTIVE conversations (newest first).
 - ``GET  /chat/conversations/{id}``  — one conversation with ordered messages.
 - ``DELETE /chat/conversations/{id}`` — soft-delete a conversation.
@@ -20,7 +21,9 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
+from app.core.security import get_current_user
 from app.database.session import get_db
+from app.models.user import User
 from app.schemas.chat import ChatRequest, ChatResponse, Source
 from app.schemas.conversation import (
     ConversationDetail,
@@ -48,6 +51,7 @@ _SSE_HEADERS = {
 def chat_query(
     payload: ChatRequest,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> ChatResponse:
     """Answer a natural-language question with RAG over indexed documents.
 
@@ -71,6 +75,7 @@ def chat_query(
         top_k=payload.top_k,
         history=history,
         conversation_id=payload.conversation_id,
+        owner_id=current_user.id,
     )
 
     sources = [Source(**source) for source in result.get("sources", [])]
@@ -83,7 +88,10 @@ def chat_query(
 
 
 @router.post("/chat/stream")
-def chat_stream(payload: ChatRequest) -> StreamingResponse:
+def chat_stream(
+    payload: ChatRequest,
+    current_user: User = Depends(get_current_user),
+) -> StreamingResponse:
     """Stream a grounded answer as Server-Sent Events while persisting the turn.
 
     Emits ``data: {"delta": ...}`` frames per token, a terminal
@@ -93,6 +101,9 @@ def chat_stream(payload: ChatRequest) -> StreamingResponse:
     the body streams).
     """
     history = [message.model_dump() for message in payload.history] if payload.history else None
+    # Capture the owner id as a plain int: the SSE generator runs AFTER the
+    # request-scoped DB session closes, so the ORM ``User`` must not cross into it.
+    owner_id = current_user.id
     logger.info(
         "POST /chat/stream query=%r top_k=%s conversation_id=%s",
         payload.query,
@@ -106,6 +117,7 @@ def chat_stream(payload: ChatRequest) -> StreamingResponse:
             top_k=payload.top_k,
             history=history,
             conversation_id=payload.conversation_id,
+            owner_id=owner_id,
         ):
             if kind == "delta":
                 yield f"data: {json.dumps({'delta': value})}\n\n"
@@ -121,10 +133,35 @@ def chat_stream(payload: ChatRequest) -> StreamingResponse:
     )
 
 
+@router.post(
+    "/chat/conversations",
+    response_model=ConversationOut,
+    status_code=201,
+)
+def create_conversation(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ConversationOut:
+    """Start a fresh, empty conversation owned by the caller and return its id.
+
+    Lets the client begin a brand-new chat (e.g. on login/session start) without
+    sending a first message. The returned ``id`` is unique and scoped to the
+    caller (``user_id == current_user.id``); subsequent ``/chat/query`` or
+    ``/chat/stream`` calls pass it as ``conversation_id``. Sending no
+    ``conversation_id`` to those endpoints also auto-creates a new one, so this
+    endpoint is purely for clients that want the id up front.
+    """
+    conversation = chat_service.create_conversation(db, owner_id=current_user.id)
+    return ConversationOut.model_validate(conversation)
+
+
 @router.get("/chat/conversations", response_model=ConversationList)
-def list_conversations(db: Session = Depends(get_db)) -> ConversationList:
-    """List ACTIVE conversations, newest first."""
-    conversations = chat_service.list_conversations(db)
+def list_conversations(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ConversationList:
+    """List the caller's own ACTIVE conversations, newest first."""
+    conversations = chat_service.list_conversations(db, owner_id=current_user.id)
     items = [ConversationOut.model_validate(c) for c in conversations]
     return ConversationList(items=items, total=len(items))
 
@@ -133,12 +170,16 @@ def list_conversations(db: Session = Depends(get_db)) -> ConversationList:
 def get_conversation(
     conversation_id: int,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> ConversationDetail:
-    """Return one ACTIVE conversation with its chronological ACTIVE messages.
+    """Return one of the caller's own ACTIVE conversations with its ACTIVE messages.
 
-    Raises 404 (via ``NotFoundError``) when the conversation is missing/deleted.
+    Raises 404 (via ``NotFoundError``) when the conversation is missing/deleted or
+    owned by another user (no existence leak).
     """
-    conversation = chat_service.get_conversation_or_404(db, conversation_id)
+    conversation = chat_service.get_conversation_or_404(
+        db, conversation_id, owner_id=current_user.id
+    )
     messages = chat_service.get_conversation_messages(db, conversation_id)
     return ConversationDetail(
         id=conversation.id,
@@ -153,7 +194,8 @@ def get_conversation(
 def delete_conversation(
     conversation_id: int,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> MessageResponse:
-    """Soft-delete a conversation (status = DELETED) and its messages."""
-    chat_service.soft_delete_conversation(db, conversation_id)
+    """Soft-delete one of the caller's own conversations (status = DELETED) and its messages."""
+    chat_service.soft_delete_conversation(db, conversation_id, owner_id=current_user.id)
     return MessageResponse(detail=f"Conversation {conversation_id} deleted")

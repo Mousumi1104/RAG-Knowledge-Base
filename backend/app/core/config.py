@@ -71,6 +71,12 @@ class Settings(BaseSettings):
     # Dev defaults let tests run with zero extra env. OVERRIDE IN PRODUCTION.
     ADMIN_USERNAME: str = "admin"
     ADMIN_PASSWORD: str = "admin123"
+    # Login email for the seeded admin user (used by the multi-tenant migration
+    # seed). ADMIN_USERNAME ("admin") is not a valid email, so the admin logs in
+    # with this address.
+    ADMIN_EMAIL: str = "admin@local"
+    # Gate for public self-registration (POST /auth/register).
+    ALLOW_REGISTRATION: bool = True
     JWT_SECRET_KEY: str = "dev-secret-change-me-in-production"
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 720

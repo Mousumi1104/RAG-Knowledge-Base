@@ -8,7 +8,7 @@ shared :class:`TimestampStatusMixin` for the common PostgreSQL fields (``id``,
 
 from __future__ import annotations
 
-from sqlalchemy import String
+from sqlalchemy import BigInteger, ForeignKey, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import Base, TimestampStatusMixin
@@ -19,6 +19,13 @@ class Conversation(Base, TimestampStatusMixin):
 
     __tablename__ = "conversations"
 
+    # Owning user; every conversation is scoped to its creator.
+    user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", name="fk_conversations_user_id_users"),
+        nullable=False,
+        index=True,
+    )
     # Auto-derived from the first user message (truncated) or NULL ("New conversation").
     title: Mapped[str | None] = mapped_column(String(512), nullable=True)
 
