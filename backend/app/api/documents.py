@@ -103,7 +103,7 @@ async def upload_document(
     return DocumentOut.model_validate(document)
 
 
-@public_router.get("/{doc_id}/file")
+@public_router.get("/{doc_id}/file", response_model=None)
 def get_document_file(doc_id: int, db: Session = Depends(get_db)) -> FileResponse | RedirectResponse:
     """Publicly serve an active document's original file for inline rendering.
 
