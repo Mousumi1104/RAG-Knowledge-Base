@@ -10,7 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
 from app.core.security import get_current_admin
@@ -22,6 +22,7 @@ from app.schemas.document import (
     ReindexResponse,
 )
 from app.services import document_service
+from app.utils import cloud_storage
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -103,7 +104,7 @@ async def upload_document(
 
 
 @public_router.get("/{doc_id}/file")
-def get_document_file(doc_id: int, db: Session = Depends(get_db)) -> FileResponse:
+def get_document_file(doc_id: int, db: Session = Depends(get_db)) -> FileResponse | RedirectResponse:
     """Publicly serve an active document's original file for inline rendering.
 
     Returns the stored file with the correct media type and an ``inline`` content
@@ -114,6 +115,10 @@ def get_document_file(doc_id: int, db: Session = Depends(get_db)) -> FileRespons
     document = document_service.get_document(db, doc_id)
     if document is None:
         raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
+
+    # Remote-stored (Cloudinary) files: redirect to the CDN URL for inline render.
+    if cloud_storage.is_remote(document.file_path):
+        return RedirectResponse(document.file_path, status_code=307)
 
     path = Path(document.file_path)
     if not path.is_file():

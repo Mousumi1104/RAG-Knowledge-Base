@@ -7,13 +7,57 @@ and strips control characters so downstream chunking/embedding sees clean text.
 
 from __future__ import annotations
 
+import os
 import re
+import tempfile
 import unicodedata
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 from app.utils.errors import UnsupportedFileTypeError
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+# Timeout (seconds) for downloading remotely-stored documents before extraction.
+_DOWNLOAD_TIMEOUT = 30.0
+
+
+def _is_remote(file_path: str) -> bool:
+    """True when ``file_path`` is an http(s) URL rather than a local path."""
+    return file_path.startswith("http://") or file_path.startswith("https://")
+
+
+@contextmanager
+def _local_path(file_path: str, document_type: str) -> Iterator[str]:
+    """Yield a usable local path for ``file_path``.
+
+    Local paths are yielded unchanged. Remote http(s) URLs (e.g. Cloudinary)
+    are downloaded into a temporary file (extension preserved so library
+    sniffing behaves) which is removed on exit.
+    """
+    if not _is_remote(file_path):
+        yield file_path
+        return
+
+    import httpx
+
+    with httpx.Client(follow_redirects=True, timeout=_DOWNLOAD_TIMEOUT) as client:
+        response = client.get(file_path)
+        response.raise_for_status()
+        data = response.content
+
+    suffix = f".{(document_type or '').lower().lstrip('.')}" if document_type else ""
+    fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        yield tmp_path
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
 # Control characters except common whitespace (tab, newline, carriage return).
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -79,19 +123,22 @@ def extract_pages(file_path: str, document_type: str) -> list[tuple[int, str]]:
     """
     doc_type = (document_type or "").lower().lstrip(".")
 
-    if doc_type == "pdf":
-        return [
-            (page_number, clean_text(raw))
-            for page_number, raw in enumerate(_extract_pdf_pages(file_path), start=1)
-        ]
-    if doc_type == "docx":
-        return [(1, clean_text(_extract_docx(file_path)))]
-    if doc_type in ("txt", "md"):
-        return [(1, clean_text(_extract_text_file(file_path)))]
+    if doc_type not in ("pdf", "docx", "txt", "md"):
+        raise UnsupportedFileTypeError(
+            f"Cannot extract text from unsupported type '{document_type}'"
+        )
 
-    raise UnsupportedFileTypeError(
-        f"Cannot extract text from unsupported type '{document_type}'"
-    )
+    # Resolve remote (Cloudinary) URLs to a temp file; local paths pass through.
+    with _local_path(file_path, doc_type) as local:
+        if doc_type == "pdf":
+            return [
+                (page_number, clean_text(raw))
+                for page_number, raw in enumerate(_extract_pdf_pages(local), start=1)
+            ]
+        if doc_type == "docx":
+            return [(1, clean_text(_extract_docx(local)))]
+        # txt / md
+        return [(1, clean_text(_extract_text_file(local)))]
 
 
 def extract_text(file_path: str, document_type: str) -> str:

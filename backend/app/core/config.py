@@ -49,6 +49,14 @@ class Settings(BaseSettings):
     CHUNK_OVERLAP: int = 100
     TOP_K: int = 8
 
+    # --- Cloudinary (remote document storage) ----------------------------
+    # When all three are set, uploaded files are stored on Cloudinary instead of
+    # the local uploads disk (Render free tier has no persistent disk). Unset =
+    # local-disk fallback, identical to the original behavior.
+    CLOUDINARY_CLOUD_NAME: str | None = None
+    CLOUDINARY_API_KEY: str | None = None
+    CLOUDINARY_API_SECRET: str | None = None
+
     # --- Uploads ----------------------------------------------------------
     # ``0`` (or any value <= 0) means *unlimited* — the size guard is skipped.
     MAX_UPLOAD_MB: int = 0
@@ -66,6 +74,15 @@ class Settings(BaseSettings):
     JWT_SECRET_KEY: str = "dev-secret-change-me-in-production"
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 720
+
+    @property
+    def cloudinary_enabled(self) -> bool:
+        """True only when all three Cloudinary credentials are configured."""
+        return bool(
+            self.CLOUDINARY_CLOUD_NAME
+            and self.CLOUDINARY_API_KEY
+            and self.CLOUDINARY_API_SECRET
+        )
 
     @field_validator("ALLOWED_EXTENSIONS", "CORS_ORIGINS", mode="before")
     @classmethod

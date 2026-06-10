@@ -11,6 +11,7 @@ pgvector>=0.2.5
 pypdf
 python-docx
 httpx
+cloudinary
 numpy
 pytest
 pytest-asyncio

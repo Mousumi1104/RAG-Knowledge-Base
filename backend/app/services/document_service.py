@@ -14,8 +14,10 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.database.base import Status
 from app.models.document import Document
+from app.utils import cloud_storage
 from app.utils.errors import NotFoundError
 from app.utils.files import sanitize_filename, validate_upload
 from app.utils.logging import get_logger
@@ -33,13 +35,22 @@ def _ensure_uploads_dir() -> Path:
     return UPLOADS_DIR
 
 
-def _store_bytes(data: bytes, filename: str) -> tuple[Path, str]:
-    """Persist ``data`` under a unique, sanitized name; return (path, safe_name)."""
+def _store_bytes(data: bytes, filename: str) -> tuple[str, str]:
+    """Persist ``data`` and return ``(stored_location, safe_name)``.
+
+    ``stored_location`` is a Cloudinary ``secure_url`` when Cloudinary is
+    configured (Render free tier has no persistent disk), otherwise the local
+    filesystem path as a string. Either value is what gets saved to
+    ``Document.file_path``.
+    """
     safe_name = sanitize_filename(filename)
+    if settings.cloudinary_enabled:
+        url = cloud_storage.upload_bytes(data, safe_name)
+        return url, safe_name
     unique = uuid.uuid4().hex
     target = _ensure_uploads_dir() / f"{unique}_{safe_name}"
     target.write_bytes(data)
-    return target, safe_name
+    return str(target), safe_name
 
 
 def _cleanup_vectors(db: Session, doc_id: int) -> None:
@@ -70,13 +81,13 @@ def create_document(
 ) -> Document:
     """Validate, store, and create a new document row (status ACTIVE, pending)."""
     doc_type = validate_upload(filename, len(upload_file_bytes))
-    target, safe_name = _store_bytes(upload_file_bytes, filename)
+    stored_location, safe_name = _store_bytes(upload_file_bytes, filename)
 
     document = Document(
         filename=safe_name,
         document_type=doc_type,
         uploaded_by=uploaded_by or "admin",
-        file_path=str(target),
+        file_path=stored_location,
         size=len(upload_file_bytes),
         indexing_status="pending",
         chunk_count=0,
@@ -126,6 +137,11 @@ def soft_delete_document(db: Session, doc_id: int) -> Document:
     # Guarded hook: remove vectors from the store and soft-delete chunk rows.
     _cleanup_vectors(db, document.id)
 
+    # Best-effort cleanup of the remote-stored file (local files are left in
+    # place on soft delete, matching the original behavior).
+    if cloud_storage.is_remote(document.file_path):
+        cloud_storage.delete_url(document.file_path)
+
     logger.info("Soft-deleted document id=%s", doc_id)
     return document
 
@@ -135,19 +151,25 @@ def reupload_document(db: Session, doc_id: int, new_bytes: bytes, filename: str)
     document = get_document_or_404(db, doc_id)
     doc_type = validate_upload(filename, len(new_bytes))
 
-    target, safe_name = _store_bytes(new_bytes, filename)
+    stored_location, safe_name = _store_bytes(new_bytes, filename)
 
-    # Best-effort removal of the previous stored file.
-    old_path = Path(document.file_path)
-    if old_path.exists() and old_path != target:
-        try:
-            old_path.unlink()
-        except OSError as exc:
-            logger.warning("Could not remove old file %s: %s", old_path, exc)
+    # Best-effort removal of the previous stored file. Remote files go through
+    # Cloudinary deletion; local files are unlinked from disk as before.
+    old_location = document.file_path
+    if old_location and old_location != stored_location:
+        if cloud_storage.is_remote(old_location):
+            cloud_storage.delete_url(old_location)
+        else:
+            old_path = Path(old_location)
+            if old_path.exists():
+                try:
+                    old_path.unlink()
+                except OSError as exc:
+                    logger.warning("Could not remove old file %s: %s", old_path, exc)
 
     document.filename = safe_name
     document.document_type = doc_type
-    document.file_path = str(target)
+    document.file_path = stored_location
     document.size = len(new_bytes)
     document.indexing_status = "pending"
     document.chunk_count = 0
