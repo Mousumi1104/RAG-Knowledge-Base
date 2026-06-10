@@ -8,6 +8,7 @@ import {
   listDocuments,
   reindexDocument,
   uploadDocumentWithProgress,
+  warmUpBackend,
   type DocumentOut,
 } from "@/services/api";
 
@@ -51,6 +52,12 @@ export default function DocumentUpload() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // Start waking a possibly-cold backend (Render free tier) as soon as the
+  // upload UI mounts, so the first upload doesn't hit a cold-start 502.
+  useEffect(() => {
+    void warmUpBackend();
+  }, []);
 
   const onUpload = useCallback(async () => {
     if (!file) {

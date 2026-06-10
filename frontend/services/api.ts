@@ -296,6 +296,29 @@ function extractErrorFromText(text: string, status: number, statusText: string):
 }
 
 /**
+ * Wake a possibly cold-started backend (Render free tier sleeps after ~15 min
+ * idle). Polls `/health` with an escalating backoff until it returns 2xx or the
+ * `budgetMs` time budget is exhausted. Failures (502/503 or network errors while
+ * the dyno spins up) are swallowed so we keep retrying. Returns `true` once the
+ * backend responded OK, `false` if the budget ran out.
+ */
+export async function warmUpBackend(budgetMs = 60000): Promise<boolean> {
+  const delays = [0, 2000, 3000, 5000, 8000, 13000, 13000];
+  const start = Date.now();
+  for (const d of delays) {
+    if (d) await new Promise((r) => setTimeout(r, d));
+    if (Date.now() - start > budgetMs) break;
+    try {
+      const res = await fetch(`${API_BASE_URL}/health`, { method: "GET" });
+      if (res.ok) return true;
+    } catch {
+      /* keep retrying — backend may be cold */
+    }
+  }
+  return false;
+}
+
+/**
  * Upload a document via XMLHttpRequest so upload progress can be reported.
  *
  * Unlike `fetch`, XHR exposes `upload.onprogress`, letting callers drive a
@@ -308,7 +331,7 @@ function extractErrorFromText(text: string, status: number, statusText: string):
  * `onProgress` receives a fraction in `[0, 1]` while bytes are uploading, or
  * `null` when the total length is unknown (non-computable progress).
  */
-export function uploadDocumentWithProgress({
+export async function uploadDocumentWithProgress({
   file,
   uploadedBy,
   token,
@@ -319,41 +342,89 @@ export function uploadDocumentWithProgress({
   token?: string | null;
   onProgress?: (fraction: number | null) => void;
 }): Promise<DocumentOut> {
-  return new Promise<DocumentOut>((resolve, reject) => {
-    const form = new FormData();
-    form.append("file", file);
-    if (uploadedBy) {
-      form.append("uploaded_by", uploadedBy);
-    }
+  // A single upload attempt wrapped in a Promise. Resolves with the parsed
+  // DocumentOut on 2xx. On a retryable failure (network error, or 502/503/504
+  // from a cold/waking backend) it rejects with `{ retryable: true }`; on a
+  // definitive HTTP error (e.g. 400/401/413/415/422) it rejects with the parsed
+  // `detail` message and `{ retryable: false }` so the caller stops immediately.
+  const attempt = (): Promise<DocumentOut> =>
+    new Promise<DocumentOut>((resolve, reject) => {
+      // Each attempt re-sends the whole file, so restart the progress bar.
+      onProgress?.(0);
 
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", `${API_BASE_URL}/documents/upload`);
-    if (token) {
-      xhr.setRequestHeader("Authorization", `Bearer ${token}`);
-    }
-
-    xhr.upload.onprogress = (e: ProgressEvent) => {
-      onProgress?.(e.lengthComputable ? e.loaded / e.total : null);
-    };
-
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        try {
-          resolve(JSON.parse(xhr.responseText) as DocumentOut);
-        } catch (e) {
-          reject(e instanceof Error ? e : new Error(String(e)));
-        }
-        return;
+      const form = new FormData();
+      form.append("file", file);
+      if (uploadedBy) {
+        form.append("uploaded_by", uploadedBy);
       }
-      reject(new Error(extractErrorFromText(xhr.responseText, xhr.status, xhr.statusText)));
-    };
 
-    xhr.onerror = () => {
-      reject(new Error("Network error during upload."));
-    };
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", `${API_BASE_URL}/documents/upload`);
+      if (token) {
+        xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+      }
 
-    xhr.send(form);
-  });
+      xhr.upload.onprogress = (e: ProgressEvent) => {
+        onProgress?.(e.lengthComputable ? e.loaded / e.total : null);
+      };
+
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            resolve(JSON.parse(xhr.responseText) as DocumentOut);
+          } catch (e) {
+            reject(e instanceof Error ? e : new Error(String(e)));
+          }
+          return;
+        }
+        // 502/503/504 typically mean the backend is still waking — retry.
+        if (xhr.status === 502 || xhr.status === 503 || xhr.status === 504) {
+          reject({ retryable: true });
+          return;
+        }
+        reject({
+          retryable: false,
+          message: extractErrorFromText(xhr.responseText, xhr.status, xhr.statusText),
+        });
+      };
+
+      xhr.onerror = () => {
+        // Network error — often the blocked CORS preflight against a cold dyno.
+        reject({ retryable: true });
+      };
+
+      xhr.send(form);
+    });
+
+  const isRetryable = (e: unknown): boolean =>
+    typeof e === "object" && e !== null && (e as { retryable?: unknown }).retryable === true;
+
+  const maxAttempts = 3;
+  const backoffs = [2000, 4000]; // applied before retry 2 and retry 3
+  let lastError: unknown;
+
+  for (let i = 0; i < maxAttempts; i++) {
+    // Give a possibly-cold backend a chance to wake before each attempt.
+    await warmUpBackend();
+    try {
+      return await attempt();
+    } catch (e) {
+      lastError = e;
+      if (!isRetryable(e)) {
+        const message = (e as { message?: unknown }).message;
+        throw new Error(typeof message === "string" ? message : String(e));
+      }
+      // Retryable: back off, then loop (which re-warms) — unless out of tries.
+      if (i < maxAttempts - 1) {
+        await new Promise((r) => setTimeout(r, backoffs[i] ?? 4000));
+      }
+    }
+  }
+
+  void lastError;
+  throw new Error(
+    "Could not reach the server — it may be waking up (free tier). Please try again in a moment.",
+  );
 }
 
 export async function uploadDocument(file: File, uploadedBy?: string): Promise<DocumentOut> {
