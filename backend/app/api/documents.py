@@ -9,12 +9,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
 from app.core.security import get_current_admin
-from app.database.session import get_db
+from app.database.session import SessionLocal, get_db
 from app.schemas.document import (
     DocumentList,
     DocumentOut,
@@ -51,12 +51,17 @@ admin_router = APIRouter(
 )
 
 
-def _trigger_indexing(db: Session, doc_id: int, *, reindex: bool = False) -> None:
-    """Guarded hook to kick off (re)indexing for a document.
+def _run_indexing_bg(doc_id: int, *, reindex: bool = False) -> None:
+    """Run (re)indexing for a document in the background.
 
-    Delegates to ``app.services.indexing_service``. Indexing runs synchronously
-    (fine for the POC); any failure is caught and logged so it cannot fail the
-    request — the document is marked ``failed`` by the service instead.
+    Scheduled via ``BackgroundTasks`` so it runs *after* the response is sent.
+    Because this is a plain ``def`` (not ``async``), Starlette executes it in a
+    worker threadpool, so heavy CPU/IO indexing never blocks the event loop (or
+    ``/health``).
+
+    It opens its **own** short-lived DB session: the request-scoped ``db`` is
+    already closed by the time this runs, so it must not be reused. Any failure
+    is caught and logged — the indexing service marks the document ``failed``.
     """
     try:
         from app.services.indexing_service import (  # type: ignore[import-not-found]
@@ -66,13 +71,22 @@ def _trigger_indexing(db: Session, doc_id: int, *, reindex: bool = False) -> Non
     except ImportError:
         logger.debug("Indexing service not available; document %s stays pending", doc_id)
         return
+
+    session = SessionLocal()
     try:
         if reindex:
-            reindex_document(db, doc_id)
+            reindex_document(session, doc_id)
         else:
-            index_document(db, doc_id)
-    except Exception as exc:  # noqa: BLE001 - indexing failure must not fail the request
-        logger.warning("Indexing trigger failed for document %s: %s", doc_id, exc)
+            index_document(session, doc_id)
+        session.commit()
+    except Exception as exc:  # noqa: BLE001 - background indexing must never crash the worker
+        logger.warning("Background indexing failed for document %s: %s", doc_id, exc)
+        try:
+            session.rollback()
+        except Exception:  # noqa: BLE001 - best-effort rollback
+            pass
+    finally:
+        session.close()
 
 
 # --- Public routes --------------------------------------------------------
@@ -82,14 +96,21 @@ def _trigger_indexing(db: Session, doc_id: int, *, reindex: bool = False) -> Non
 # ``/{doc_id}`` route — FastAPI matches per-router and the path differs.
 @public_router.post("/upload", response_model=DocumentOut, status_code=201)
 async def upload_document(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ) -> DocumentOut:
-    """Publicly upload a document: validate, store, create the row, trigger indexing.
+    """Publicly upload a document: validate, store, create the row, queue indexing.
 
     This endpoint is intentionally unauthenticated. Uploads are always attributed
     to ``"anonymous"`` — any client-supplied ``uploaded_by`` is ignored so a caller
     cannot spoof ``"admin"``.
+
+    Size/type validation happens inside ``create_document`` (``validate_upload``)
+    *before* the file is stored, so an oversized file is rejected with 413 quickly.
+    Indexing is scheduled as a background task and the row is returned immediately
+    (status ``pending``/``processing``) so a large document never times out the
+    request.
     """
     contents = await file.read()
     document = document_service.create_document(
@@ -98,9 +119,11 @@ async def upload_document(
         filename=file.filename or "upload",
         uploaded_by="anonymous",
     )
-    _trigger_indexing(db, document.id)
-    db.refresh(document)
-    return DocumentOut.model_validate(document)
+    # Snapshot the response payload before the request session closes, then run
+    # indexing in the background (own session) so the response returns instantly.
+    result = DocumentOut.model_validate(document)
+    background_tasks.add_task(_run_indexing_bg, document.id)
+    return result
 
 
 @public_router.get("/{doc_id}/file", response_model=None)
@@ -164,13 +187,17 @@ def delete_document(doc_id: int, db: Session = Depends(get_db)) -> MessageRespon
 
 
 @admin_router.post("/{doc_id}/reindex", response_model=ReindexResponse)
-def reindex_document(doc_id: int, db: Session = Depends(get_db)) -> ReindexResponse:
-    """Reset indexing status to pending and trigger the indexing hook."""
+def reindex_document(
+    doc_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+) -> ReindexResponse:
+    """Reset indexing status to pending and queue reindexing in the background."""
     document = document_service.set_indexing_status(db, doc_id, status="pending")
-    _trigger_indexing(db, document.id, reindex=True)
-    db.refresh(document)
-    return ReindexResponse(
+    response = ReindexResponse(
         id=document.id,
         indexing_status=document.indexing_status,
         detail="Reindex triggered",
     )
+    background_tasks.add_task(_run_indexing_bg, document.id, reindex=True)
+    return response

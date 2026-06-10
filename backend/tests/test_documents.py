@@ -14,9 +14,12 @@ def test_upload_txt_indexes(client) -> None:
     assert body["document_type"] == "txt"
     assert body["status"] == 1  # ACTIVE
     assert body["size"] > 0
-    # Indexing runs synchronously on upload -> should end up 'indexed'.
-    assert body["indexing_status"] == "indexed"
-    assert body["chunk_count"] > 0
+    # Indexing now runs in a background task (so large files don't time out the
+    # request). The TestClient runs background tasks before returning, so by the
+    # time we re-fetch the document it should be fully indexed.
+    fetched = client.get(f"/documents/{body['id']}").json()
+    assert fetched["indexing_status"] == "indexed"
+    assert fetched["chunk_count"] > 0
 
 
 def test_upload_md_indexes(client) -> None:
@@ -29,8 +32,9 @@ def test_upload_md_indexes(client) -> None:
     assert resp.status_code == 201
     body = resp.json()
     assert body["document_type"] == "md"
-    assert body["indexing_status"] == "indexed"
-    assert body["chunk_count"] > 0
+    fetched = client.get(f"/documents/{body['id']}").json()
+    assert fetched["indexing_status"] == "indexed"
+    assert fetched["chunk_count"] > 0
 
 
 def test_list_only_active(client) -> None:
@@ -96,8 +100,11 @@ def test_reindex_endpoint(client) -> None:
     assert resp.status_code == 200
     body = resp.json()
     assert body["id"] == doc_id
-    assert body["indexing_status"] == "indexed"
     assert body["detail"]
+    # Reindex is queued as a background task; the TestClient runs it before
+    # returning, so the document ends up 'indexed' once we re-fetch it.
+    fetched = client.get(f"/documents/{doc_id}").json()
+    assert fetched["indexing_status"] == "indexed"
 
 
 def test_unsupported_extension_415(client) -> None:

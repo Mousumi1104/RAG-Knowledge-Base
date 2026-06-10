@@ -19,6 +19,8 @@ clients.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -31,6 +33,11 @@ from app.utils.logging import get_logger
 from app.vectorstore import VectorStore, get_vector_store
 
 logger = get_logger(__name__)
+
+# Embed/persist this many chunks at a time so peak memory stays bounded to one
+# batch (not the whole document) — critical on the 512MB free instance where a
+# multi-thousand-chunk PDF would otherwise OOM-kill the worker.
+BATCH = 200
 
 # Lazy module-level singletons (built on first use, reused afterwards).
 _embedding_provider: EmbeddingProvider | None = None
@@ -120,52 +127,66 @@ def index_document(db: Session, document_id: int) -> Document | None:
             return document
 
         provider = _get_embedding_provider()
-        contents = [chunk["content"] for chunk in chunks]
-        embeddings = provider.embed_texts(contents)
+        doc_id = int(document.id)
 
-        ids = [chunk["chunk_id"] for chunk in chunks]
-        metadatas = [
-            {
-                "document_id": int(document.id),
-                "chunk_id": chunk["chunk_id"],
-                "position": int(chunk["position"]),
-                "page": chunk.get("page"),
-                "content": chunk["content"],
-            }
-            for chunk in chunks
-        ]
+        # Process in fixed-size batches so peak memory is ~one batch, never the
+        # whole document. For each batch we build only that batch's contents /
+        # embeddings / metadatas / Chunk rows, persist them, then drop all
+        # references so the batch can be GC'd before the next one is built.
+        total = 0
+        for start in range(0, len(chunks), BATCH):
+            batch = chunks[start : start + BATCH]
 
-        # Embeddings live on the chunk rows, so the rows must exist (and be
-        # committed) before the store — which uses its own session/connection —
-        # writes vectors onto them by chunk_id.
-        for chunk in chunks:
-            db.add(
-                Chunk(
-                    document_id=document.id,
-                    chunk_id=chunk["chunk_id"],
-                    content=chunk["content"],
-                    position=int(chunk["position"]),
-                    page=chunk.get("page"),
-                    status=Status.ACTIVE.value,
+            batch_ids = [c["chunk_id"] for c in batch]
+            batch_contents = [c["content"] for c in batch]
+            batch_embeddings = provider.embed_texts(batch_contents)
+            batch_metadatas = [
+                {
+                    "document_id": doc_id,
+                    "chunk_id": c["chunk_id"],
+                    "position": int(c["position"]),
+                    "page": c.get("page"),
+                    "content": c["content"],
+                }
+                for c in batch
+            ]
+
+            # Embeddings live on the chunk rows, so the rows must exist (and be
+            # committed) before the store — which uses its own session/connection
+            # — writes vectors onto them by chunk_id.
+            for c in batch:
+                db.add(
+                    Chunk(
+                        document_id=doc_id,
+                        chunk_id=c["chunk_id"],
+                        content=c["content"],
+                        position=int(c["position"]),
+                        page=c.get("page"),
+                        status=Status.ACTIVE.value,
+                    )
                 )
-            )
-        db.flush()
-        db.commit()
+            db.flush()
+            db.commit()
 
-        store.add(
-            ids=ids,
-            embeddings=embeddings,
-            metadatas=metadatas,
-            documents=contents,
-        )
+            store.add(
+                ids=batch_ids,
+                embeddings=batch_embeddings,
+                metadatas=batch_metadatas,
+                documents=batch_contents,
+            )
+
+            total += len(batch)
+            # Drop per-batch references so this batch is collectible before the
+            # next batch is built (keeps peak memory ~one batch).
+            del batch, batch_ids, batch_contents, batch_embeddings, batch_metadatas
 
         document.indexing_status = "indexed"
-        document.chunk_count = len(chunks)
+        document.chunk_count = total
         document.error = None
         db.add(document)
         db.commit()
         db.refresh(document)
-        logger.info("Indexed document id=%s with %s chunks", document.id, len(chunks))
+        logger.info("Indexed document id=%s with %s chunks", document.id, total)
         return document
 
     except Exception as exc:  # noqa: BLE001 - any failure marks the doc failed
@@ -198,6 +219,37 @@ def reindex_document(db: Session, document_id: int) -> Document | None:
     db.commit()
 
     return index_document(db, document_id)
+
+
+def fail_stale_processing(db: Session, older_than_minutes: int = 15) -> int:
+    """Mark long-stuck ``processing`` documents as ``failed``.
+
+    A worker OOM-kill (SIGKILL) can't be caught, so a document indexing at the
+    time stays ``processing`` forever. On startup we sweep ACTIVE documents whose
+    ``indexing_status`` is ``processing`` and whose ``last_modified`` (falling back
+    to ``added_time``) is older than the threshold, marking them ``failed`` with a
+    clear error so they can be retried/reindexed.
+
+    Returns the number of documents updated.
+    """
+    cutoff = datetime.now(UTC) - timedelta(minutes=older_than_minutes)
+    stmt = select(Document).where(
+        Document.status == Status.ACTIVE.value,
+        Document.indexing_status == "processing",
+    )
+    updated = 0
+    for document in db.execute(stmt).scalars().all():
+        stamp = document.last_modified or document.added_time
+        if stamp is not None and stamp > cutoff:
+            continue
+        document.indexing_status = "failed"
+        document.error = "indexing interrupted (worker restarted)"
+        db.add(document)
+        updated += 1
+    if updated:
+        db.commit()
+        logger.warning("Marked %s stale 'processing' document(s) as failed", updated)
+    return updated
 
 
 def delete_document_vectors(db: Session, document_id: int) -> None:

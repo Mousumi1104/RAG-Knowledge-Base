@@ -22,10 +22,30 @@ logger = get_logger(__name__)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    """Application lifespan: initialize the database on startup."""
+    """Application lifespan: initialize the database on startup.
+
+    Also sweeps documents left in ``processing`` by an OOM-killed worker so they
+    don't stay stuck forever (the SIGKILL can't be caught to mark them failed).
+    """
     logger.info("Starting RAG Knowledge Base API")
     init_db()
+    _recover_stale_processing()
     yield
+
+
+def _recover_stale_processing() -> None:
+    """Mark OOM-orphaned ``processing`` documents as failed (best-effort)."""
+    try:
+        from app.database.session import SessionLocal
+        from app.services.indexing_service import fail_stale_processing
+
+        session = SessionLocal()
+        try:
+            fail_stale_processing(session)
+        finally:
+            session.close()
+    except Exception as exc:  # noqa: BLE001 - startup recovery must never crash boot
+        logger.warning("Stale-processing recovery skipped: %s", exc)
 
 
 def create_app() -> FastAPI:

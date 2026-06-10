@@ -14,11 +14,13 @@ def test_upload_creates_active_chunks(client, db) -> None:
     created = upload_file(client, LEAVE_POLICY_NAME, LEAVE_POLICY_TEXT).json()
     doc_id = created["id"]
 
-    assert created["indexing_status"] == "indexed"
-    assert created["chunk_count"] > 0
+    # Indexing runs in a background task; re-fetch to observe the final state.
+    fetched = client.get(f"/documents/{doc_id}").json()
+    assert fetched["indexing_status"] == "indexed"
+    assert fetched["chunk_count"] > 0
 
     chunks = db.execute(select(Chunk).where(Chunk.document_id == doc_id)).scalars().all()
-    assert len(chunks) == created["chunk_count"]
+    assert len(chunks) == fetched["chunk_count"]
     assert all(c.status == Status.ACTIVE.value for c in chunks)
     assert all(c.content for c in chunks)
     # chunk_id values are unique and stable.
@@ -31,7 +33,8 @@ def test_reindex_keeps_indexed(client, db) -> None:
 
     resp = client.post(f"/documents/{doc_id}/reindex")
     assert resp.status_code == 200
-    assert resp.json()["indexing_status"] == "indexed"
+    # Reindex is queued in the background; re-fetch to observe the final state.
+    assert client.get(f"/documents/{doc_id}").json()["indexing_status"] == "indexed"
 
     chunks = (
         db.execute(
