@@ -1,0 +1,76 @@
+# =============================================================================
+# RAG Knowledge Base — full-stack deployment (db + backend + frontend)
+#
+#   docker compose up --build
+#
+# Env values are read from a root `.env` file (copy `.env.example`).
+# NOTE: inside this compose network the DB host is `db:5432`, NOT the
+# local-dev `127.0.0.1:54329` used by scripts/pg_local.sh + backend/.env.
+# The local-dev workflow is unaffected by this file.
+# =============================================================================
+
+services:
+  # --- PostgreSQL 16 + pgvector ----------------------------------------------
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: raguser
+      POSTGRES_DB: ragdb
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ragpass}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # `pg_isready` against our role/db; backend waits for this to pass.
+      test: ["CMD-SHELL", "pg_isready -U raguser -d ragdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # --- FastAPI backend (runs `alembic upgrade head` then uvicorn) ------------
+  backend:
+    build:
+      context: ./backend
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # Inside compose the DB host is `db` on the default 5432 port.
+      DATABASE_URL: postgresql+psycopg://raguser:${POSTGRES_PASSWORD:-ragpass}@db:5432/ragdb
+      VECTOR_DB: pgvector
+      # Provider policy: local 384-dim embedder, Gemini thinking-disabled LLM.
+      EMBEDDING_PROVIDER: local
+      LLM_PROVIDER: gemini
+      GEMINI_MODEL: gemini-2.5-flash
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      # Allow the dockerized frontend origin (and localhost dev) through CORS.
+      CORS_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
+      # Auth — supplied via .env. CHANGE THESE IN PRODUCTION.
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-dev-secret-change-me-in-production}
+    volumes:
+      # Persist uploaded source documents across container restarts.
+      - uploads:/app/uploads
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  # --- Next.js frontend ------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # NEXT_PUBLIC_* is inlined at BUILD time (Next 14): change -> rebuild.
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+    depends_on:
+      - backend
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  uploads:

@@ -1,0 +1,4 @@
+# Development-only tooling (linting & formatting). Not required at runtime.
+# Install with: pip install -r requirements-dev.txt
+ruff>=0.6,<0.13
+black>=24.0,<26.0

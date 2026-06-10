@@ -1,0 +1,604 @@
+"""RAG chat business logic.
+
+The flow is:
+
+1. Sanitize the incoming question (strip, length-limit).
+2. Retrieve the most relevant ACTIVE chunks via ``search_service.search``.
+3. Build a strictly-grounded prompt from those chunks (and optional history).
+4. Call the configured LLM provider to generate an answer.
+5. Return ``{answer, sources}`` where every source is traceable back to a
+   document/chunk that actually contributed context.
+
+Provider robustness: if the configured cloud provider raises a
+``RateLimitError``/``ProviderError`` (or any unexpected error), we fall back to
+the deterministic local extractive provider so the endpoint still returns a
+grounded answer instead of a 500.
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Iterator, Mapping, Sequence
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.database.base import Status
+from app.database.session import SessionLocal
+from app.models.conversation import Conversation
+from app.models.message import Message
+from app.rag.llm import LocalExtractiveLLMProvider, get_llm_provider
+from app.rag.prompt import build_rag_prompt
+from app.services import search_service
+from app.utils.errors import NotFoundError, ProviderError, RateLimitError
+from app.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+# Defensive cap on question length to bound prompt size and abuse.
+_MAX_QUESTION_CHARS = 4000
+
+# Max length for an auto-derived conversation title (from the first user message).
+_MAX_TITLE_CHARS = 80
+
+_NO_CONTEXT_ANSWER = (
+    "I couldn't find relevant information in the knowledge base to answer your " "question."
+)
+
+# Phrases that mark an answer as a "not found"/disclaimer reply. Matched against
+# the answer normalized exactly like ``_is_smalltalk`` does (lowercased,
+# punctuation -> spaces, whitespace collapsed) so e.g. "couldn't" -> "couldn t".
+# Kept specific to avoid false positives on normal grounded answers.
+_NO_ANSWER_PHRASES: frozenset[str] = frozenset(
+    {
+        "could not find",
+        "couldn t find",
+        "not in the knowledge base",
+        "no relevant information",
+        "could not find the information",
+        "could not find relevant information",
+    }
+)
+
+
+def _is_no_answer(answer: str) -> bool:
+    """Return ``True`` when ``answer`` is a not-found/disclaimer reply.
+
+    Normalizes the answer the same way :func:`_is_smalltalk` normalizes a
+    question (lowercase, punctuation stripped to spaces, whitespace collapsed)
+    so contractions like "couldn't" become "couldn t", then returns ``True`` if
+    the normalized text contains any phrase from :data:`_NO_ANSWER_PHRASES`.
+    """
+    if not answer:
+        return False
+    norm = re.sub(r"[^a-z0-9\s]", " ", answer.lower())
+    norm = re.sub(r"\s+", " ", norm).strip()
+    if not norm:
+        return False
+    return any(phrase in norm for phrase in _NO_ANSWER_PHRASES)
+
+# Minimum retrieval similarity for a chunk to count as usable context. Weakly
+# matching hits (e.g. for greetings/small talk like "Hello", which score ~0.05
+# with the local embedder) are dropped so they neither pollute the prompt nor
+# surface as irrelevant source chips. Real questions score well above this.
+# Calibrated for the local hashing embedder; revisit if the embedder changes.
+_MIN_RELEVANCE_SCORE = 0.1
+
+# Friendly, brand-neutral reply for greetings/small talk. No sources attached.
+_SMALLTALK_ANSWER = (
+    "Hi! I'm a knowledge-base Q&A assistant. I can answer questions using the "
+    "documents in the knowledge base. What would you like to know?"
+)
+
+# Short, bare greeting/identity/small-talk tokens. Matched only against the FULL
+# normalized message (so they cannot be substring-matched inside a real question).
+_SMALLTALK_PHRASES: frozenset[str] = frozenset(
+    {
+        "hi",
+        "hii",
+        "hiii",
+        "hello",
+        "helo",
+        "hey",
+        "heya",
+        "hey there",
+        "hi there",
+        "hello there",
+        "yo",
+        "sup",
+        "whats up",
+        "what s up",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "good day",
+        "greetings",
+        "how are you",
+        "how are you doing",
+        "how r u",
+        "how are u",
+        "hows it going",
+        "how is it going",
+        "how do you do",
+        "who are you",
+        "what are you",
+        "what is your name",
+        "what s your name",
+        "whats your name",
+        "what can you do",
+        "what do you do",
+        "help",
+        "thanks",
+        "thank you",
+        "thank you so much",
+        "thanks a lot",
+        "thx",
+        "ty",
+        "cheers",
+        "bye",
+        "goodbye",
+        "good bye",
+        "see you",
+        "see ya",
+        "cya",
+        "ok thanks",
+        "okay thanks",
+        "ok thank you",
+        "nice to meet you",
+    }
+)
+
+# Max word count for a message to even be considered small talk. Real questions
+# tend to be longer; this guards against swallowing genuine queries that happen
+# to start with a greeting word.
+_SMALLTALK_MAX_WORDS = 6
+
+
+def _is_smalltalk(question: str) -> bool:
+    """Return ``True`` for short greetings/identity/thanks/farewell small talk.
+
+    STRICT by design: matches only when the *entire* normalized message (lower
+    cased, punctuation stripped) is a known whole-phrase greeting. It never
+    substring-matches, so real questions such as
+    ``"what is the transpose of a matrix?"`` return ``False`` even though they
+    begin with ``"what is"``.
+    """
+    if not question:
+        return False
+    # Normalize: lowercase, strip punctuation to spaces, collapse whitespace.
+    normalized = re.sub(r"[^a-z0-9\s]", " ", question.lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized:
+        return False
+    # Guard: anything beyond a short phrase is treated as a real message.
+    if len(normalized.split()) > _SMALLTALK_MAX_WORDS:
+        return False
+    return normalized in _SMALLTALK_PHRASES
+
+
+def _persist_smalltalk_turn(db: Session, conv_id: int, cleaned: str) -> Message:
+    """Persist the user + assistant messages for a small-talk turn (sources=[])."""
+    _save_message(db, conv_id, "user", cleaned)
+    return _save_message(db, conv_id, "assistant", _SMALLTALK_ANSWER, sources=[])
+
+
+def _sanitize_question(question: str) -> str:
+    """Strip and length-limit the raw user question."""
+    cleaned = (question or "").strip()
+    if len(cleaned) > _MAX_QUESTION_CHARS:
+        cleaned = cleaned[:_MAX_QUESTION_CHARS].rstrip()
+    return cleaned
+
+
+def _build_sources(hits: Sequence[Mapping[str, object]]) -> list[dict]:
+    """Shape search hits into API source dicts, deduped by (document, excerpt).
+
+    Keeps every distinct contributing excerpt but drops exact duplicates so a
+    document chunked into near-identical pieces does not flood the source list.
+    The highest-scoring occurrence is retained for each unique excerpt.
+    """
+    seen: set[tuple[int, str]] = set()
+    sources: list[dict] = []
+    for hit in hits:
+        document_id = int(hit.get("document_id", 0) or 0)
+        excerpt = str(hit.get("excerpt") or "")
+        key = (document_id, excerpt)
+        if key in seen:
+            continue
+        seen.add(key)
+        raw_page = hit.get("page")
+        try:
+            page = int(raw_page) if raw_page is not None else None
+        except (TypeError, ValueError):
+            page = None
+        sources.append(
+            {
+                "document": str(hit.get("document_name") or "unknown document"),
+                "excerpt": excerpt,
+                "document_id": document_id,
+                "page": page,
+                "score": float(hit.get("score", 0.0) or 0.0),
+            }
+        )
+    return sources
+
+
+def _generate_answer(system: str, user: str) -> str:
+    """Generate an answer, falling back to the local provider on provider errors."""
+    provider = get_llm_provider()
+    try:
+        return provider.generate(user, system=system)
+    except (RateLimitError, ProviderError) as exc:
+        logger.warning(
+            "LLM provider failed (%s); falling back to local extractive provider.",
+            exc,
+        )
+    except Exception as exc:  # noqa: BLE001 - never 500 on generation
+        logger.error("Unexpected LLM provider error: %s; falling back to local.", exc)
+
+    if isinstance(provider, LocalExtractiveLLMProvider):
+        # Local provider already failed unexpectedly; return a safe message.
+        return _NO_CONTEXT_ANSWER
+    return LocalExtractiveLLMProvider().generate(user, system=system)
+
+
+def _stream_answer_deltas(system: str, user: str) -> Iterator[str]:
+    """Yield answer deltas, falling back to the local provider on provider errors.
+
+    Mirrors :func:`_generate_answer` but for the streaming path. The selected
+    provider's ``generate_stream`` already self-falls back to a local word
+    stream on transport/rate-limit errors, so this is a second safety net for
+    unexpected failures (e.g. provider construction). Never raises.
+    """
+    provider = get_llm_provider()
+    try:
+        yield from provider.generate_stream(user, system=system)
+        return
+    except (RateLimitError, ProviderError) as exc:
+        logger.warning(
+            "LLM provider stream failed (%s); falling back to local extractive provider.",
+            exc,
+        )
+    except Exception as exc:  # noqa: BLE001 - never raise from the stream.
+        logger.error("Unexpected LLM provider stream error: %s; falling back to local.", exc)
+
+    if isinstance(provider, LocalExtractiveLLMProvider):
+        # Local provider already failed; emit a safe single chunk.
+        yield _NO_CONTEXT_ANSWER
+        return
+    try:
+        yield from LocalExtractiveLLMProvider().generate_stream(user, system=system)
+    except Exception as exc:  # noqa: BLE001 - never raise from the stream.
+        logger.error("Local fallback stream failed: %s", exc)
+        yield _NO_CONTEXT_ANSWER
+
+
+# --- Conversation / message persistence -------------------------------------
+
+
+def _derive_title(question: str) -> str:
+    """Derive a short conversation title from the first user message."""
+    cleaned = (question or "").strip().replace("\n", " ")
+    if len(cleaned) > _MAX_TITLE_CHARS:
+        cleaned = cleaned[:_MAX_TITLE_CHARS].rstrip() + "..."
+    return cleaned or "New conversation"
+
+
+def _get_active_conversation(db: Session, conversation_id: int) -> Conversation | None:
+    """Return one ACTIVE conversation by id, or ``None``."""
+    stmt = select(Conversation).where(
+        Conversation.id == conversation_id,
+        Conversation.status == Status.ACTIVE.value,
+    )
+    return db.execute(stmt).scalars().first()
+
+
+def resolve_or_create_conversation(
+    db: Session,
+    conversation_id: int | None,
+    question: str,
+) -> Conversation:
+    """Resolve an existing ACTIVE conversation or create a new one.
+
+    When ``conversation_id`` is given and refers to an ACTIVE conversation it is
+    reused; otherwise (omitted, null, or not found) a new conversation is created
+    with a title derived from ``question``. Commits so the id is available.
+    """
+    if conversation_id is not None:
+        conversation = _get_active_conversation(db, conversation_id)
+        if conversation is not None:
+            return conversation
+        logger.info(
+            "conversation_id=%s not found/inactive; creating a new conversation.",
+            conversation_id,
+        )
+
+    conversation = Conversation(title=_derive_title(question))
+    db.add(conversation)
+    db.commit()
+    db.refresh(conversation)
+    return conversation
+
+
+def _load_history(
+    db: Session, conversation_id: int, exclude_message_id: int | None = None
+) -> list[dict]:
+    """Load prior ACTIVE messages (chronological) as ``{role, content}`` dicts."""
+    stmt = (
+        select(Message)
+        .where(
+            Message.conversation_id == conversation_id,
+            Message.status == Status.ACTIVE.value,
+        )
+        .order_by(Message.id.asc())
+    )
+    messages = db.execute(stmt).scalars().all()
+    return [
+        {"role": m.role, "content": m.content}
+        for m in messages
+        if exclude_message_id is None or m.id != exclude_message_id
+    ]
+
+
+def _save_message(
+    db: Session,
+    conversation_id: int,
+    role: str,
+    content: str,
+    sources: list[dict] | None = None,
+) -> Message:
+    """Persist a single message and commit; returns the refreshed row."""
+    message = Message(
+        conversation_id=conversation_id,
+        role=role,
+        content=content,
+        sources=sources,
+    )
+    db.add(message)
+    db.commit()
+    db.refresh(message)
+    return message
+
+
+def _retrieve_and_build_prompt(
+    db: Session,
+    cleaned_question: str,
+    top_k: int | None,
+    history: Sequence[Mapping[str, str]] | None,
+) -> tuple[str, str, list[dict]]:
+    """Retrieve context and build the grounded prompt.
+
+    Returns ``(system, user, sources)``. ``sources`` is empty when no context is
+    retrieved (the prompt still instructs the model to disclaim).
+    """
+    hits = search_service.search(db, query=cleaned_question, top_k=top_k)
+    relevant = [
+        hit for hit in hits if float(hit.get("score", 0.0) or 0.0) >= _MIN_RELEVANCE_SCORE
+    ]
+    logger.info(
+        "Chat query=%r retrieved %s chunk(s), %s above relevance threshold",
+        cleaned_question,
+        len(hits),
+        len(relevant),
+    )
+    system, user = build_rag_prompt(cleaned_question, relevant, history=history)
+    return system, user, _build_sources(relevant)
+
+
+def list_conversations(db: Session) -> list[Conversation]:
+    """Return ACTIVE conversations, newest first."""
+    stmt = (
+        select(Conversation)
+        .where(Conversation.status == Status.ACTIVE.value)
+        .order_by(Conversation.last_modified.desc(), Conversation.id.desc())
+    )
+    return list(db.execute(stmt).scalars().all())
+
+
+def get_conversation_or_404(db: Session, conversation_id: int) -> Conversation:
+    """Return one ACTIVE conversation or raise :class:`NotFoundError`."""
+    conversation = _get_active_conversation(db, conversation_id)
+    if conversation is None:
+        raise NotFoundError(f"Conversation {conversation_id} not found")
+    return conversation
+
+
+def get_conversation_messages(db: Session, conversation_id: int) -> list[Message]:
+    """Return ACTIVE messages of a conversation in chronological (id ASC) order."""
+    stmt = (
+        select(Message)
+        .where(
+            Message.conversation_id == conversation_id,
+            Message.status == Status.ACTIVE.value,
+        )
+        .order_by(Message.id.asc())
+    )
+    return list(db.execute(stmt).scalars().all())
+
+
+def soft_delete_conversation(db: Session, conversation_id: int) -> Conversation:
+    """Soft-delete a conversation (and its messages); raises 404 if missing."""
+    conversation = get_conversation_or_404(db, conversation_id)
+    conversation.status = Status.DELETED.value
+    db.add(conversation)
+    for message in get_conversation_messages(db, conversation_id):
+        message.status = Status.DELETED.value
+        db.add(message)
+    db.commit()
+    logger.info("Soft-deleted conversation id=%s", conversation_id)
+    return conversation
+
+
+def stream_answer(
+    question: str,
+    top_k: int | None = None,
+    history: Sequence[Mapping[str, str]] | None = None,
+    conversation_id: int | None = None,
+) -> Iterator[tuple[str, object]]:
+    """Stream a grounded answer while persisting the conversation turn.
+
+    Owns its OWN ``SessionLocal()`` session (the request-scoped ``get_db``
+    session is closed before a ``StreamingResponse`` body runs). Resolves/creates
+    the conversation and persists the user message before streaming, then
+    persists the assistant message after streaming.
+
+    Yields tuples the API layer turns into SSE frames:
+
+    - ``("delta", text)`` for each streamed token (many).
+    - ``("done", {"sources", "conversation_id", "message_id"})`` once at the end.
+    - ``("error", message)`` if anything fails; the generator never raises.
+    """
+    db = SessionLocal()
+    try:
+        cleaned = _sanitize_question(question)
+        conversation = resolve_or_create_conversation(db, conversation_id, cleaned or question)
+        conv_id = conversation.id
+
+        if not cleaned:
+            _save_message(db, conv_id, "user", question or "")
+            assistant_msg = _save_message(db, conv_id, "assistant", _NO_CONTEXT_ANSWER, sources=[])
+            yield ("delta", _NO_CONTEXT_ANSWER)
+            yield (
+                "done",
+                {
+                    "sources": [],
+                    "conversation_id": conv_id,
+                    "message_id": assistant_msg.id,
+                },
+            )
+            return
+
+        # Greetings/small talk: short-circuit BEFORE retrieval so no sources
+        # attach. Kept symmetric with the non-streaming query() path.
+        if _is_smalltalk(cleaned):
+            assistant_msg = _persist_smalltalk_turn(db, conv_id, cleaned)
+            yield ("delta", _SMALLTALK_ANSWER)
+            yield (
+                "done",
+                {
+                    "sources": [],
+                    "conversation_id": conv_id,
+                    "message_id": assistant_msg.id,
+                },
+            )
+            return
+
+        _save_message(db, conv_id, "user", cleaned)
+
+        # DB is the source of truth for history; prefer prior messages, but fall
+        # back to a client-supplied history when present and DB has nothing.
+        db_history = _load_history(db, conv_id)
+        # Drop the just-saved user turn from history so it is not duplicated by
+        # the prompt's explicit "Question:" line.
+        effective_history: Sequence[Mapping[str, str]] | None
+        if len(db_history) > 1:
+            effective_history = db_history[:-1]
+        else:
+            effective_history = history
+
+        system, user, sources = _retrieve_and_build_prompt(db, cleaned, top_k, effective_history)
+
+        chunks: list[str] = []
+        for delta in _stream_answer_deltas(system, user):
+            if not delta:
+                continue
+            chunks.append(delta)
+            yield ("delta", delta)
+
+        full_answer = "".join(chunks) or _NO_CONTEXT_ANSWER
+        # The answer disclaims having found anything: drop sources so the "done"
+        # frame and the persisted message don't surface unbacked chips.
+        if sources and _is_no_answer(full_answer):
+            sources = []
+        assistant_msg = _save_message(db, conv_id, "assistant", full_answer, sources=sources)
+        yield (
+            "done",
+            {
+                "sources": sources,
+                "conversation_id": conv_id,
+                "message_id": assistant_msg.id,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - never raise out of the SSE generator.
+        logger.error("stream_answer failed: %s", exc)
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        yield ("error", "An error occurred while generating the answer.")
+    finally:
+        db.close()
+
+
+def query(
+    db: Session,
+    question: str,
+    top_k: int | None = None,
+    history: Sequence[Mapping[str, str]] | None = None,
+    conversation_id: int | None = None,
+) -> dict:
+    """Answer ``question`` with RAG over indexed documents and persist the turn.
+
+    Args:
+        db: Database session used for retrieval/active-filtering and persistence.
+        question: The user's natural-language question.
+        top_k: Optional override for the number of chunks to retrieve.
+        history: Optional prior conversation turns for follow-up support.
+        conversation_id: Optional existing conversation to continue; a new one is
+            created when omitted/null or not found.
+
+    Returns:
+        ``{"answer", "sources", "conversation_id", "message_id"}`` where each
+        source is ``{document, excerpt, document_id, page, score}``. When nothing
+        relevant is found, ``sources`` is empty and the answer says so. The turn
+        (user + assistant messages) is persisted to the resolved conversation.
+    """
+    cleaned = _sanitize_question(question)
+    conversation = resolve_or_create_conversation(db, conversation_id, cleaned or question)
+    conv_id = conversation.id
+
+    if not cleaned:
+        _save_message(db, conv_id, "user", question or "")
+        assistant_msg = _save_message(db, conv_id, "assistant", _NO_CONTEXT_ANSWER, sources=[])
+        return {
+            "answer": _NO_CONTEXT_ANSWER,
+            "sources": [],
+            "conversation_id": conv_id,
+            "message_id": assistant_msg.id,
+        }
+
+    # Greetings/small talk: short-circuit BEFORE retrieval so no sources attach.
+    if _is_smalltalk(cleaned):
+        assistant_msg = _persist_smalltalk_turn(db, conv_id, cleaned)
+        return {
+            "answer": _SMALLTALK_ANSWER,
+            "sources": [],
+            "conversation_id": conv_id,
+            "message_id": assistant_msg.id,
+        }
+
+    _save_message(db, conv_id, "user", cleaned)
+
+    db_history = _load_history(db, conv_id)
+    effective_history: Sequence[Mapping[str, str]] | None
+    if len(db_history) > 1:
+        effective_history = db_history[:-1]
+    else:
+        effective_history = history
+
+    system, user, sources = _retrieve_and_build_prompt(db, cleaned, top_k, effective_history)
+    answer = _generate_answer(system, user)
+
+    # The answer disclaims having found anything: drop sources so we don't
+    # surface chips that didn't actually back the answer.
+    if sources and _is_no_answer(answer):
+        sources = []
+
+    assistant_msg = _save_message(db, conv_id, "assistant", answer, sources=sources)
+
+    return {
+        "answer": answer,
+        "sources": sources,
+        "conversation_id": conv_id,
+        "message_id": assistant_msg.id,
+    }

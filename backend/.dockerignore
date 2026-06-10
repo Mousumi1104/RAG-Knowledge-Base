@@ -1,0 +1,31 @@
+# Virtualenvs
+venv/
+.venv/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Secrets & local env (NEVER bake into the image)
+.env
+.env.*
+!.env.example
+
+# Local uploads (a fresh empty dir is created in the image)
+uploads/*
+!uploads/.gitkeep
+
+# Userspace Postgres cluster from pg_local.sh
+.pg/
+
+# Agent / tooling dirs
+.a5c/
+
+# Docs & reports (not needed at runtime)
+*.md
+
+# Tests (not needed in the runtime image)
+tests/

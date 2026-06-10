@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Environment / secrets
+.env
+
+# Local databases & vector store
+*.db
+rag.db
+chroma_db/
+
+# Userspace PostgreSQL cluster (pg_local.sh)
+backend/.pg/
+
+# Uploaded files (keep the directory via .gitkeep)
+uploads/*
+!uploads/.gitkeep

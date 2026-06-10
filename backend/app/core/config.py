@@ -1,0 +1,101 @@
+"""Application configuration via pydantic-settings.
+
+A single cached ``Settings`` object is loaded from environment variables / ``.env``.
+No secret is ever hardcoded; absence of API keys is a valid, supported state that
+activates the local fallback providers.
+"""
+
+from __future__ import annotations
+
+from functools import lru_cache
+from typing import Annotated
+
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """Strongly-typed application settings.
+
+    Values are read from environment variables / a ``.env`` file. Unknown keys are
+    ignored so the same ``.env`` can be shared with other tooling.
+    """
+
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    # --- Database ---------------------------------------------------------
+    DATABASE_URL: str = "postgresql+psycopg://raguser@127.0.0.1:54329/ragdb"
+
+    # --- Vector store -----------------------------------------------------
+    VECTOR_DB: str = "pgvector"
+
+    # --- Providers --------------------------------------------------------
+    EMBEDDING_PROVIDER: str = "local"
+    LLM_PROVIDER: str = "local"
+    OPENAI_API_KEY: str | None = None
+    ANTHROPIC_API_KEY: str | None = None
+    # Google Gemini (free tier via Google AI Studio: https://aistudio.google.com/apikey).
+    GEMINI_API_KEY: str | None = None
+    GEMINI_MODEL: str = "gemini-2.5-flash"
+
+    # --- RAG / embedding parameters --------------------------------------
+    EMBEDDING_DIM: int = 384
+    # Smaller chunks concentrate rare terms: with the IDF-free local hashing
+    # embedder, a lone term (e.g. "transpose") in a 1000-char chunk is diluted
+    # after L2 normalization. 500/100 gives rare-term definitions enough weight
+    # to surface in vector search (a definition-only chunk then scores ~0.45 vs
+    # ~0.21 when buried in a 1000-char chunk).
+    CHUNK_SIZE: int = 500
+    CHUNK_OVERLAP: int = 100
+    TOP_K: int = 8
+
+    # --- Uploads ----------------------------------------------------------
+    # ``0`` (or any value <= 0) means *unlimited* — the size guard is skipped.
+    MAX_UPLOAD_MB: int = 0
+    # ``NoDecode`` disables pydantic-settings' eager JSON parsing of env values so
+    # the CSV-aware validator below receives the raw string.
+    ALLOWED_EXTENSIONS: Annotated[list[str], NoDecode] = ["pdf", "docx", "txt", "md"]
+
+    # --- HTTP / CORS ------------------------------------------------------
+    CORS_ORIGINS: Annotated[list[str], NoDecode] = ["http://localhost:3000"]
+
+    # --- Auth (single hardcoded admin; no users table) --------------------
+    # Dev defaults let tests run with zero extra env. OVERRIDE IN PRODUCTION.
+    ADMIN_USERNAME: str = "admin"
+    ADMIN_PASSWORD: str = "admin123"
+    JWT_SECRET_KEY: str = "dev-secret-change-me-in-production"
+    JWT_ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 720
+
+    @field_validator("ALLOWED_EXTENSIONS", "CORS_ORIGINS", mode="before")
+    @classmethod
+    def _split_csv(cls, value: object) -> object:
+        """Accept either a real list or a comma-separated string from env.
+
+        ``pydantic-settings`` reads env vars as plain strings, so a value like
+        ``pdf,docx,txt`` must be parsed into a list. A JSON array string
+        (``["pdf","docx"]``) is also accepted.
+        """
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped.startswith("["):
+                import json
+
+                try:
+                    parsed = json.loads(stripped)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, list):
+                    return [str(item).strip() for item in parsed]
+            return [item.strip() for item in stripped.split(",") if item.strip()]
+        return value
+
+
+@lru_cache
+def get_settings() -> Settings:
+    """Return a cached ``Settings`` instance (one per process)."""
+    return Settings()
+
+
+# Module-level convenience instance.
+settings: Settings = get_settings()

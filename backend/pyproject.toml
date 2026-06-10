@@ -1,0 +1,34 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
+asyncio_mode = "auto"
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# Pragmatic rule set:
+#   E  - pycodestyle errors
+#   F  - pyflakes
+#   I  - isort (import ordering)
+#   UP - pyupgrade (modern syntax)
+#   B  - flake8-bugbear (likely bugs)
+select = ["E", "F", "I", "UP", "B"]
+# E203 (whitespace before ':') and E501 (line too long) are owned by black;
+# let the formatter decide so ruff and black do not fight over wrapping.
+# B008: FastAPI's dependency-injection idiom (Depends(), File(), Query(), Body(),
+# Form()) intentionally calls functions in argument defaults; this is the
+# documented, correct usage, so the bugbear warning is a false positive here.
+ignore = ["E203", "E501", "B008"]
+
+[tool.ruff.lint.per-file-ignores]
+# Alembic-generated migration code is allowed to be long / loosely styled.
+"migrations/*" = ["E501", "E711", "F401", "I001", "UP"]
+# Package __init__ files re-export public symbols; keep the unused-import noise off.
+"**/__init__.py" = ["F401"]

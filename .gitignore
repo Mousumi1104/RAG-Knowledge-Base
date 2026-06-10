@@ -1,0 +1,31 @@
+# Deployment secrets — NEVER commit real .env files (only *.example templates).
+# Root .env is read by docker-compose; backend/.env and frontend/.env.local
+# hold real credentials and MUST stay out of version control.
+.env
+backend/.env
+frontend/.env.local
+!.env.example
+
+# Python
+backend/venv/
+**/__pycache__/
+*.pyc
+
+# Node / Next.js
+frontend/node_modules/
+frontend/.next/
+frontend/tsconfig.tsbuildinfo
+
+# Uploaded documents (never commit user content)
+backend/uploads/
+**/uploads/
+
+# OS / editor cruft
+.DS_Store
+
+# Babysitter run/journal data (large, may contain cached env/secrets) — never commit
+.a5c/
+
+# CI workflow excluded from pushes: deploy PAT lacks the `workflow` scope.
+# Restore manually or via a token with `workflow` scope.
+.github/workflows/

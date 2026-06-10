@@ -1,0 +1,27 @@
+# Dependencies (reinstalled inside the image)
+node_modules/
+.pnp
+.pnp.js
+
+# Next.js build output (rebuilt inside the image)
+.next/
+out/
+build/
+
+# Secrets & local env (NEVER bake into the image)
+.env
+.env*.local
+!.env.local.example
+
+# Caches & build info
+*.tsbuildinfo
+.cache/
+
+# Agent / tooling dirs
+.a5c/
+
+# Misc
+.DS_Store
+*.pem
+npm-debug.log*
+README.md
