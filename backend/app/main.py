@@ -48,9 +48,19 @@ def create_app() -> FastAPI:
 
     register_exception_handlers(app)
 
-    @app.get("/health", tags=["health"])
+    @app.api_route("/", methods=["GET", "HEAD"], tags=["health"])
+    def root() -> dict[str, str]:
+        """Root landing/liveness route (also satisfies uptime monitors hitting `/`)."""
+        return {
+            "status": "ok",
+            "service": "RAG Knowledge Base API",
+            "docs": "/docs",
+            "health": "/health",
+        }
+
+    @app.api_route("/health", methods=["GET", "HEAD"], tags=["health"])
     def health() -> dict[str, str]:
-        """Liveness probe."""
+        """Liveness probe (GET and HEAD; HEAD is the default for many uptime monitors)."""
         return {"status": "ok"}
 
     # --- Router extension point -------------------------------------------
