@@ -9,8 +9,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.core.security import get_current_admin
@@ -127,7 +128,7 @@ async def upload_document(
 
 
 @public_router.get("/{doc_id}/file", response_model=None)
-def get_document_file(doc_id: int, db: Session = Depends(get_db)) -> FileResponse | RedirectResponse:
+def get_document_file(doc_id: int, db: Session = Depends(get_db)) -> FileResponse | StreamingResponse:
     """Publicly serve an active document's original file for inline rendering.
 
     Returns the stored file with the correct media type and an ``inline`` content
@@ -139,19 +140,52 @@ def get_document_file(doc_id: int, db: Session = Depends(get_db)) -> FileRespons
     if document is None:
         raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
 
-    # Remote-stored (Cloudinary) files: redirect to the CDN URL for inline render.
+    media_type = _MEDIA_TYPES.get(
+        (document.document_type or "").lower().lstrip("."),
+        "application/octet-stream",
+    )
+
+    # Remote-stored (Cloudinary) files: stream the bytes back THROUGH the backend
+    # with inline headers rather than redirecting. Cloudinary serves ``raw``
+    # resources as ``application/octet-stream`` with a ``Content-Disposition:
+    # attachment`` (forcing a download) and a 307 redirect also drops the
+    # ``#page=N`` fragment. Proxying keeps the URL on our origin so the fragment
+    # survives and the browser renders the file inline at the right page.
     if cloud_storage.is_remote(document.file_path):
-        return RedirectResponse(document.file_path, status_code=307)
+        url = document.file_path
+        try:
+            client = httpx.Client(follow_redirects=True, timeout=30.0)
+            upstream = client.stream("GET", url)
+            response = upstream.__enter__()
+            if response.status_code != 200:
+                upstream.__exit__(None, None, None)
+                client.close()
+                logger.warning("Upstream fetch for document %s returned %s", doc_id, response.status_code)
+                raise HTTPException(status_code=502, detail=f"Document {doc_id} source is unavailable")
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001 - upstream failures become a 502
+            logger.warning("Failed to fetch remote file for document %s: %s", doc_id, exc)
+            raise HTTPException(status_code=502, detail=f"Document {doc_id} source is unavailable") from exc
+
+        def _iter() -> "object":
+            try:
+                yield from response.iter_bytes()
+            finally:
+                upstream.__exit__(None, None, None)
+                client.close()
+
+        return StreamingResponse(
+            _iter(),
+            media_type=media_type,
+            headers={"Content-Disposition": f'inline; filename="{document.filename}"'},
+        )
 
     path = Path(document.file_path)
     if not path.is_file():
         logger.warning("Document %s file missing on disk: %s", doc_id, document.file_path)
         raise HTTPException(status_code=404, detail=f"Document {doc_id} file not found")
 
-    media_type = _MEDIA_TYPES.get(
-        (document.document_type or "").lower().lstrip("."),
-        "application/octet-stream",
-    )
     return FileResponse(
         path,
         media_type=media_type,
