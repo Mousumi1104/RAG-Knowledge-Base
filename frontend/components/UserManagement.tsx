@@ -9,6 +9,7 @@ import {
   listAllUsers,
   type UserOut,
 } from "@/services/api";
+import { useAuth } from "@/components/AuthProvider";
 
 interface UserManagementProps {
   /** Called when an authed request returns 401 so the page can show login. */
@@ -24,6 +25,7 @@ interface UserManagementProps {
  * pre-guard the admin's own row beyond a visual hint).
  */
 export default function UserManagement({ onAuthError }: UserManagementProps) {
+  const { user: currentUser } = useAuth();
   const [users, setUsers] = useState<UserOut[]>([]);
   const [loading, setLoading] = useState(false);
   const [busyId, setBusyId] = useState<number | null>(null);
@@ -45,13 +47,17 @@ export default function UserManagement({ onAuthError }: UserManagementProps) {
     setLoading(true);
     setError(null);
     try {
-      setUsers(await listAllUsers());
+      // The server already excludes super-admins (role === "admin"). Filter
+      // defensively here too so no super-admin or the current admin's own
+      // account is ever shown as a manageable/deletable row.
+      const all = await listAllUsers();
+      setUsers(all.filter((u) => u.role !== "admin" && u.id !== currentUser?.id));
     } catch (e) {
       handleError(e);
     } finally {
       setLoading(false);
     }
-  }, [handleError]);
+  }, [handleError, currentUser?.id]);
 
   useEffect(() => {
     void refresh();

@@ -15,9 +15,22 @@ import {
 
 type UploadPhase = "idle" | "uploading" | "indexing";
 
+/**
+ * Which parts of the admin document UI to render:
+ * - "all": global upload + the all-documents table (default).
+ * - "upload": only the global upload control.
+ * - "list": only the all-documents table.
+ *
+ * This lets the admin sidebar surface "Global Upload" and "Documents" as
+ * separate sections while reusing this one component and its shared state.
+ */
+type DocumentsSection = "all" | "upload" | "list";
+
 interface AdminDocumentsProps {
   /** Called when an authed request returns 401 so the page can show login. */
   onAuthError: () => void;
+  /** Which sub-sections to render (defaults to "all"). */
+  section?: DocumentsSection;
 }
 
 function statusClass(status: string): string {
@@ -36,7 +49,9 @@ function statusClass(status: string): string {
  * delete or reindex any document, and exposes a GLOBAL upload control
  * (POST /documents/global) for docs that ground every user's answers.
  */
-export default function AdminDocuments({ onAuthError }: AdminDocumentsProps) {
+export default function AdminDocuments({ onAuthError, section = "all" }: AdminDocumentsProps) {
+  const showUpload = section === "all" || section === "upload";
+  const showList = section === "all" || section === "list";
   const [docs, setDocs] = useState<DocumentOut[]>([]);
   const [loadingList, setLoadingList] = useState(false);
   const [busyId, setBusyId] = useState<number | null>(null);
@@ -167,7 +182,7 @@ export default function AdminDocuments({ onAuthError }: AdminDocumentsProps) {
   return (
     <section className="card admin-dashboard">
       <div className="chat-header">
-        <h2>Document management</h2>
+        <h2>{section === "upload" ? "Global upload" : "Document management"}</h2>
         <div className="chat-toolbar">
           <button className="secondary" onClick={() => void refresh()} disabled={loadingList}>
             {loadingList ? "Refreshing..." : "Refresh"}
@@ -175,36 +190,42 @@ export default function AdminDocuments({ onAuthError }: AdminDocumentsProps) {
         </div>
       </div>
 
-      <h3 className="admin-subhead">Global upload</h3>
-      <p className="muted">
-        A global document grounds every user&apos;s answers but never appears in any user&apos;s
-        personal library.
-      </p>
-      <div className="row">
-        <input
-          ref={fileInputRef}
-          type="file"
-          onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-          disabled={uploading}
-        />
-        <button onClick={() => void onGlobalUpload()} disabled={uploading || !file}>
-          {uploading ? "Uploading..." : "Upload global"}
-        </button>
-      </div>
+      {showUpload && (
+        <>
+          {section === "all" && <h3 className="admin-subhead">Global upload</h3>}
+          <p className="muted">
+            A global document grounds every user&apos;s answers but never appears in any
+            user&apos;s personal library.
+          </p>
+          <div className="row">
+            <input
+              ref={fileInputRef}
+              type="file"
+              onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+              disabled={uploading}
+            />
+            <button onClick={() => void onGlobalUpload()} disabled={uploading || !file}>
+              {uploading ? "Uploading..." : "Upload global"}
+            </button>
+          </div>
 
-      {phase === "uploading" && (
-        <ProgressBar
-          value={progress}
-          label={progress === null ? "Uploading…" : `Uploading… ${Math.round(progress * 100)}%`}
-        />
+          {phase === "uploading" && (
+            <ProgressBar
+              value={progress}
+              label={
+                progress === null ? "Uploading…" : `Uploading… ${Math.round(progress * 100)}%`
+              }
+            />
+          )}
+          {phase === "indexing" && <ProgressBar indeterminate label="Indexing…" />}
+        </>
       )}
-      {phase === "indexing" && <ProgressBar indeterminate label="Indexing…" />}
 
       {notice && <p className="notice">{notice}</p>}
       {error && <p className="error">{error}</p>}
 
-      <h3 className="admin-subhead">All documents</h3>
-      {docs.length === 0 ? (
+      {showList && <h3 className="admin-subhead">All documents</h3>}
+      {!showList ? null : docs.length === 0 ? (
         <p className="muted">{loadingList ? "Loading documents..." : "No documents."}</p>
       ) : (
         <table className="doc-table">

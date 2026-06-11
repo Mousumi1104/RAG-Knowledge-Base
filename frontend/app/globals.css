@@ -1078,6 +1078,114 @@ a.button-link.secondary:hover {
   padding: 2px 0;
 }
 
+/* --- Admin shell (left-sidebar layout, ADMIN PAGE ONLY) ------------------- */
+
+.admin-shell {
+  display: flex;
+  min-height: 100vh;
+  width: 100%;
+  background: var(--bg);
+}
+
+.admin-sidebar {
+  display: flex;
+  flex-direction: column;
+  width: 240px;
+  flex-shrink: 0;
+  background: #f7f7f8;
+  border-right: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  height: 100vh;
+}
+
+.admin-sidebar-header {
+  padding: 18px 16px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.admin-sidebar-sub {
+  margin: 2px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.admin-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 8px;
+  flex: 1 1 auto;
+  overflow-y: auto;
+}
+
+.admin-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  justify-content: flex-start;
+  padding: 9px 12px;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+  text-align: left;
+}
+
+.admin-nav-item:hover:not(:disabled) {
+  background: #ececef;
+}
+
+.admin-nav-item-active,
+.admin-nav-item-active:hover:not(:disabled) {
+  background: var(--primary);
+  color: #fff;
+}
+
+.admin-nav-icon {
+  font-size: 16px;
+  line-height: 1;
+}
+
+.admin-sidebar-footer {
+  padding: 14px 16px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.admin-main {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.admin-topbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--card);
+}
+
+.admin-topbar-title {
+  font-weight: 700;
+  font-size: 16px;
+}
+
+.admin-content {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 4px 20px 48px;
+  max-width: 980px;
+  width: 100%;
+}
+
 /* --- Responsive: collapsible sidebar on narrow screens -------------------- */
 
 @media (max-width: 768px) {
@@ -1102,11 +1210,33 @@ a.button-link.secondary:hover {
     transform: translateX(0);
   }
 
+  .admin-sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    height: 100%;
+    z-index: 30;
+    transform: translateX(-100%);
+    transition: transform 0.2s ease;
+    box-shadow: 2px 0 12px rgba(0, 0, 0, 0.12);
+  }
+
+  .admin-sidebar-open {
+    transform: translateX(0);
+  }
+
   .sidebar-scrim {
     display: block;
     position: fixed;
     inset: 0;
     z-index: 20;
     background: rgba(0, 0, 0, 0.35);
+  }
+}
+
+@media (min-width: 769px) {
+  .admin-topbar {
+    display: none;
   }
 }

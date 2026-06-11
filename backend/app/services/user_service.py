@@ -58,13 +58,17 @@ def get_user_or_404(db: Session, user_id: int) -> User:
     return user
 
 
-def list_users(db: Session) -> list[User]:
-    """Return all non-deleted users, newest first."""
-    stmt = (
-        select(User)
-        .where(User.status != Status.DELETED.value)
-        .order_by(User.added_time.desc(), User.id.desc())
-    )
+def list_users(db: Session, exclude_admins: bool = False) -> list[User]:
+    """Return non-deleted users, newest first.
+
+    When ``exclude_admins`` is set, super-admin accounts (``role == 'admin'``)
+    are filtered out so the admin user-management list never surfaces the
+    super-admin (including the requesting admin) as a manageable/deletable user.
+    """
+    stmt = select(User).where(User.status != Status.DELETED.value)
+    if exclude_admins:
+        stmt = stmt.where(User.role != "admin")
+    stmt = stmt.order_by(User.added_time.desc(), User.id.desc())
     return list(db.execute(stmt).scalars().all())
 
 

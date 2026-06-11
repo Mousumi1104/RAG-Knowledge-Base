@@ -86,9 +86,14 @@ def get_health(db: Session = Depends(get_db)) -> HealthResponse:
 # --- User management ---------------------------------------------------------
 @router.get("/users", response_model=list[UserOut])
 def list_users(db: Session = Depends(get_db)) -> list[User]:
-    """List all non-deleted users (safe ``UserOut`` — never includes hashes)."""
+    """List manageable users (safe ``UserOut`` — never includes hashes).
+
+    Super-admin accounts (``role == 'admin'``) are excluded server-side so the
+    requesting admin (and any other super-admin) never appears in the
+    user-management list and cannot be disabled/deleted from it.
+    """
     logger.info("GET /admin/users")
-    return user_service.list_users(db)
+    return user_service.list_users(db, exclude_admins=True)
 
 
 @router.post("/users/{user_id}/enable", response_model=UserOut)
