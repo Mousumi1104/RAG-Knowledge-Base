@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 
 import bcrypt
 import jwt
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Query, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 
@@ -93,6 +93,21 @@ def get_current_user(
     user, a soft-deleted user (``status != ACTIVE``), or a disabled user
     (``is_active == False``).
     """
+    return _resolve_user_from_token(token, db)
+
+
+# OAuth2 scheme that does NOT auto-error when the Authorization header is absent,
+# so the file-serve route can fall back to a ``?token=`` query param for plain
+# browser navigations (which cannot send an Authorization header).
+_oauth2_optional = OAuth2PasswordBearer(tokenUrl="auth/login", auto_error=False)
+
+
+def _resolve_user_from_token(token: str, db: Session) -> User:
+    """Decode a JWT, load the active user, or raise the 401 credentials error.
+
+    Shared by the header- and query-param auth paths so both verify the token the
+    exact same way (same secret/alg) and apply the identical active-user checks.
+    """
     try:
         payload = decode_token(token)
     except jwt.PyJWTError as exc:
@@ -110,6 +125,26 @@ def get_current_user(
     if user is None or user.status != Status.ACTIVE.value or not user.is_active:
         raise _CREDENTIALS_EXCEPTION
     return user
+
+
+def get_current_user_query_or_header(
+    token: str | None = Depends(_oauth2_optional),
+    query_token: str | None = Query(default=None, alias="token"),
+    db: Session = Depends(get_db),
+) -> User:
+    """Resolve the current user from the Bearer header OR a ``?token=`` query param.
+
+    Plain top-level browser navigations (e.g. opening a document/source link in a
+    new tab) cannot send an ``Authorization: Bearer`` header. This dependency
+    keeps the normal header path for API callers and, only when the header is
+    absent, falls back to a short-lived access token passed as ``?token=<jwt>``.
+    The token is verified with the same secret/algorithm and the same active-user
+    checks as :func:`get_current_user`; ownership is still enforced by the route.
+    """
+    effective = token or query_token
+    if not effective:
+        raise _CREDENTIALS_EXCEPTION
+    return _resolve_user_from_token(effective, db)
 
 
 def require_admin(current_user: User = Depends(get_current_user)) -> User:

@@ -245,16 +245,25 @@ export interface ChatSource {
 }
 
 /**
- * Build the public inline-file URL for a source document.
+ * Build the authenticated inline-file URL for a source/library document.
  *
- * Returns `${API_BASE_URL}/documents/${documentId}/file`, appending a
- * `#page=N` fragment only when `page` is a positive number so PDF viewers
- * open directly at the cited page.
+ * Returns `${API_BASE_URL}/documents/${documentId}/file`, appending the current
+ * access token as a `?token=` query param so a plain top-level browser
+ * navigation (opening the link in a new tab) can authenticate — such a
+ * navigation cannot send an `Authorization: Bearer` header. The backend verifies
+ * this token the same way as the header and enforces the same ownership check.
+ *
+ * A `#page=N` fragment is appended AFTER the query string (…/file?token=XYZ#page=N)
+ * only when `page` is a positive number, so PDF viewers open at the cited page.
  */
 export function documentFileUrl(documentId: number, page?: number | null): string {
-  const url = `${API_BASE_URL}/documents/${documentId}/file`;
+  let url = `${API_BASE_URL}/documents/${documentId}/file`;
+  const token = getToken();
+  if (token) {
+    url += `?token=${encodeURIComponent(token)}`;
+  }
   if (typeof page === "number" && page > 0) {
-    return `${url}#page=${page}`;
+    url += `#page=${page}`;
   }
   return url;
 }

@@ -29,8 +29,30 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     """
     logger.info("Starting RAG Knowledge Base API")
     init_db()
+    _seed_admin_user()
     _recover_stale_processing()
     yield
+
+
+def _seed_admin_user() -> None:
+    """Idempotently upsert the configured admin user (best-effort, self-healing).
+
+    Runs on every boot so the live DB repairs itself on redeploy: the admin row
+    is created if missing and otherwise reconciled (password re-hashed from
+    ADMIN_PASSWORD, role forced to ``admin``, re-activated). A failure here must
+    never crash boot (e.g. DB temporarily unavailable).
+    """
+    try:
+        from app.database.session import SessionLocal
+        from app.services.user_service import seed_admin_user
+
+        session = SessionLocal()
+        try:
+            seed_admin_user(session)
+        finally:
+            session.close()
+    except Exception as exc:  # noqa: BLE001 - admin seed must never crash boot
+        logger.warning("Admin seed skipped: %s", exc)
 
 
 def _recover_stale_processing() -> None:

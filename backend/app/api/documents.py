@@ -14,7 +14,11 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Up
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
-from app.core.security import get_current_admin, get_current_user
+from app.core.security import (
+    get_current_admin,
+    get_current_user,
+    get_current_user_query_or_header,
+)
 from app.database.session import SessionLocal, get_db
 from app.models.user import User
 from app.schemas.document import (
@@ -151,7 +155,7 @@ async def upload_document(
 def get_document_file(
     doc_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user_query_or_header),
 ) -> FileResponse | StreamingResponse:
     """Serve a document's original file for inline rendering (authenticated).
 
@@ -159,6 +163,13 @@ def get_document_file(
     only if the document is admin-global OR owned by the requesting user (admins
     may access any). Otherwise a 404 is returned — the same response as a missing
     doc, so existence of another user's private document is never revealed.
+
+    Authentication accepts either an ``Authorization: Bearer`` header (API callers)
+    or, when that header is absent, a short-lived access token in a ``?token=``
+    query param. The query-param path lets a plain top-level browser navigation
+    (opening a source/document link in a new tab) authenticate, since such a
+    navigation cannot set request headers. The same ownership check applies in
+    both cases, so tenant isolation is unchanged.
 
     Returns the stored file with the correct media type and an ``inline`` content
     disposition so a browser renders it (and PDF viewers honor ``#page=N`` deep

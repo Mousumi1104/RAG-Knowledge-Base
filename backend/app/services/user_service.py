@@ -113,6 +113,83 @@ def authenticate_user(db: Session, email: str, password: str) -> User | None:
     return user
 
 
+def resolve_admin_email() -> str:
+    """Resolve the seeded admin login email deterministically.
+
+    Prefer ``ADMIN_EMAIL`` if set; otherwise derive from ``ADMIN_USERNAME``
+    (verbatim if it already looks like an email, else ``<username>@local``).
+    This mirrors the 0004 migration's ``_admin_email`` so the startup seed and
+    the migration agree on exactly one address.
+    """
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    email = (settings.ADMIN_EMAIL or "").strip()
+    if email:
+        return normalize_email(email)
+    username = (settings.ADMIN_USERNAME or "admin").strip()
+    return normalize_email(username if "@" in username else f"{username}@local")
+
+
+def seed_admin_user(db: Session) -> User:
+    """Idempotently upsert the configured admin user (self-healing on every boot).
+
+    Resolves a deterministic admin email (see :func:`resolve_admin_email`) and:
+
+    - creates the admin if missing, or
+    - if present, re-hashes the configured ``ADMIN_PASSWORD`` into
+      ``password_hash``, forces ``role='admin'``, ``is_active=True`` and
+      ``status=ACTIVE`` (un-deletes a soft-deleted admin).
+
+    This makes the live DB repair itself on redeploy so ``/auth/login`` with the
+    configured admin credentials always succeeds with a ``role=admin`` JWT. The
+    lookup is done directly (not via :func:`get_user_by_email`, which filters out
+    DELETED rows) so a soft-deleted admin row is reactivated rather than
+    duplicated against the UNIQUE email index.
+    """
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    email = resolve_admin_email()
+    password = settings.ADMIN_PASSWORD
+
+    stmt = select(User).where(User.email == email)
+    user = db.execute(stmt).scalars().first()
+
+    if user is None:
+        user = User(
+            email=email,
+            password_hash=hash_password(password),
+            role="admin",
+            is_active=True,
+            status=Status.ACTIVE.value,
+        )
+        db.add(user)
+        try:
+            db.commit()
+        except IntegrityError:
+            # Lost a race with a concurrent seeder / the migration seed; reload.
+            db.rollback()
+            user = db.execute(stmt).scalars().first()
+            if user is None:
+                raise
+        else:
+            db.refresh(user)
+            logger.info("Seeded admin user id=%s email=%s", user.id, email)
+            return user
+
+    # Self-heal an existing row: re-hash password, force admin role + active.
+    user.password_hash = hash_password(password)
+    user.role = "admin"
+    user.is_active = True
+    user.status = Status.ACTIVE.value
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    logger.info("Reconciled admin user id=%s email=%s", user.id, email)
+    return user
+
+
 def set_active(db: Session, user_id: int, active: bool) -> User:
     """Enable/disable a user (the admin ``is_active`` toggle)."""
     user = get_user_or_404(db, user_id)
