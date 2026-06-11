@@ -228,67 +228,71 @@ export default function AdminDocuments({ onAuthError, section = "all" }: AdminDo
       {!showList ? null : docs.length === 0 ? (
         <p className="muted">{loadingList ? "Loading documents..." : "No documents."}</p>
       ) : (
-        <table className="doc-table">
-          <thead>
-            <tr>
-              <th>ID</th>
-              <th>Filename</th>
-              <th>Type</th>
-              <th>Owner</th>
-              <th>Status</th>
-              <th>Chunks</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {docs.map((doc) => (
-              <tr key={doc.id}>
-                <td>{doc.id}</td>
-                <td>
-                  <a
-                    href={documentFileUrl(doc.id)}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    title="Open document"
-                  >
-                    {doc.filename}
-                  </a>
-                </td>
-                <td>{doc.document_type}</td>
-                <td>
-                  {renderOwner(doc)}
-                  {doc.is_global && <span className="badge"> global</span>}
-                </td>
-                <td>
-                  <span className={statusClass(doc.indexing_status)}>{doc.indexing_status}</span>
-                  {doc.error && (
-                    <span className="error-inline" title={doc.error}>
-                      {" "}
-                      !
-                    </span>
-                  )}
-                </td>
-                <td>{doc.chunk_count}</td>
-                <td className="actions">
-                  <button
-                    className="secondary"
-                    onClick={() => void onReindex(doc.id)}
-                    disabled={busyId === doc.id}
-                  >
-                    Reindex
-                  </button>
-                  <button
-                    className="danger"
-                    onClick={() => void onDelete(doc.id)}
-                    disabled={busyId === doc.id}
-                  >
-                    Delete
-                  </button>
-                </td>
+        <div className="table-scroll">
+          <table className="doc-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Filename</th>
+                <th>Type</th>
+                <th>Owner</th>
+                <th>Status</th>
+                <th>Chunks</th>
+                <th>Actions</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {docs.map((doc) => (
+                <tr key={doc.id}>
+                  <td>{doc.id}</td>
+                  <td className="cell-filename">
+                    <a
+                      href={documentFileUrl(doc.id)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      title={doc.filename}
+                    >
+                      {doc.filename}
+                    </a>
+                  </td>
+                  <td>{doc.document_type}</td>
+                  <td className="cell-owner" title={renderOwner(doc)}>
+                    {renderOwner(doc)}
+                    {doc.is_global && <span className="badge"> global</span>}
+                  </td>
+                  <td>
+                    <span className={statusClass(doc.indexing_status)}>
+                      {doc.indexing_status}
+                    </span>
+                    {doc.error && (
+                      <span className="error-inline" title={doc.error}>
+                        {" "}
+                        !
+                      </span>
+                    )}
+                  </td>
+                  <td>{doc.chunk_count}</td>
+                  <td className="actions">
+                    <button
+                      className="secondary"
+                      onClick={() => void onReindex(doc.id)}
+                      disabled={busyId === doc.id}
+                    >
+                      Reindex
+                    </button>
+                    <button
+                      className="danger"
+                      onClick={() => void onDelete(doc.id)}
+                      disabled={busyId === doc.id}
+                    >
+                      Delete
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
     </section>
   );

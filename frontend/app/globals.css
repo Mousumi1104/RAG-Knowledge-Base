@@ -193,6 +193,12 @@ body {
   border-radius: 10px;
   padding: 18px;
   margin-top: 20px;
+  /* Allow the card to shrink inside flex/grid parents (e.g. the admin shell)
+     and never let wide content (long IDs/filenames, tables) push it past its
+     column. Long unbreakable strings wrap instead of forcing extra width. */
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: break-word;
 }
 
 .card h2 {
@@ -298,10 +304,19 @@ a.button-link.secondary:hover {
   font-weight: bold;
 }
 
+/* Horizontal-scroll container so a wide table scrolls WITHIN the card instead
+   of stretching it (and the page) wider than its column. */
+.table-scroll {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  margin-top: 10px;
+}
+
 .doc-table {
   width: 100%;
   border-collapse: collapse;
-  margin-top: 10px;
   font-size: 14px;
 }
 
@@ -313,9 +328,24 @@ a.button-link.secondary:hover {
   vertical-align: top;
 }
 
+/* Long filenames / emails / owner strings: wrap (and cap width) so a single
+   long token can't force the table — and thus the card — to overflow. */
+.doc-table .cell-filename {
+  max-width: 280px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.doc-table .cell-owner {
+  max-width: 200px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
 .doc-table .actions {
   display: flex;
   gap: 6px;
+  flex-wrap: wrap;
 }
 
 .badge {

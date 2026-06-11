@@ -205,12 +205,85 @@ def set_active(db: Session, user_id: int, active: bool) -> User:
     return user
 
 
+def _cascade_delete_user_documents(db: Session, user_id: int) -> int:
+    """Delete every document OWNED by ``user_id`` (DB row + vector chunks).
+
+    Each document goes through the canonical
+    :func:`app.services.document_service.soft_delete_document` path so vector
+    chunks/embeddings (and any remote-stored file) are cleaned up consistently —
+    no orphaned vectors are left behind. Admin-global / un-owned documents
+    (``owner_id IS NULL`` / ``is_global``) are intentionally NOT matched, so
+    global docs that ground every user's answers are preserved.
+
+    Idempotent: only ACTIVE, owner-matched rows are selected, so re-running on an
+    already-cleaned user is a no-op. Returns the number of documents removed.
+    """
+    # Imported lazily to avoid a heavy import (indexing/vector store) at module
+    # load and to sidestep any import cycle between the services.
+    from app.services import document_service
+
+    owned = document_service.list_documents(db, owner_id=user_id)
+    deleted = 0
+    for doc in owned:
+        # owner-scoped delete: confirms ownership and removes the doc + its
+        # vectors/chunks via the single canonical deletion path.
+        document_service.soft_delete_document(db, doc.id, owner_id=user_id)
+        deleted += 1
+    if deleted:
+        logger.info("Cascade-deleted %s document(s) for user id=%s", deleted, user_id)
+    return deleted
+
+
+def _cascade_delete_user_conversations(db: Session, user_id: int) -> int:
+    """Soft-delete every conversation owned by ``user_id`` (status = DELETED).
+
+    Idempotent: only currently non-deleted conversations are matched. Returns the
+    number of conversations soft-deleted.
+    """
+    from app.models.conversation import Conversation
+
+    stmt = select(Conversation).where(
+        Conversation.user_id == user_id,
+        Conversation.status != Status.DELETED.value,
+    )
+    convos = list(db.execute(stmt).scalars().all())
+    for convo in convos:
+        convo.status = Status.DELETED.value
+        db.add(convo)
+    if convos:
+        db.commit()
+        logger.info(
+            "Cascade-deleted %s conversation(s) for user id=%s", len(convos), user_id
+        )
+    return len(convos)
+
+
 def delete_user(db: Session, user_id: int) -> User:
-    """Soft-delete a user (status = DELETED)."""
+    """Soft-delete a user AND cascade-delete the data they own.
+
+    Order of operations:
+
+    1. Resolve the (non-deleted) user (404 otherwise).
+    2. Delete all documents the user OWNS (``owner_id == user_id``) via the
+       canonical :func:`document_service.soft_delete_document` path so their
+       vector chunks/embeddings are removed — leaving no orphaned vectors.
+       Admin-global / un-owned docs are preserved.
+    3. Soft-delete the user's conversations.
+    4. Soft-delete the user row (status = DELETED).
+
+    The self/admin guard lives in the API layer and remains in force; this
+    function is only reached for a deletable, non-self user.
+    """
     user = get_user_or_404(db, user_id)
+
+    # Clean up owned data first so a failure here aborts before the user row is
+    # marked deleted (the operation can then be safely retried; it is idempotent).
+    _cascade_delete_user_documents(db, user_id)
+    _cascade_delete_user_conversations(db, user_id)
+
     user.status = Status.DELETED.value
     db.add(user)
     db.commit()
     db.refresh(user)
-    logger.info("Soft-deleted user id=%s", user_id)
+    logger.info("Soft-deleted user id=%s (with owned documents + conversations)", user_id)
     return user
