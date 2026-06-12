@@ -82,7 +82,12 @@ def _is_no_answer(answer: str) -> bool:
 # with the local embedder) are dropped so they neither pollute the prompt nor
 # surface as irrelevant source chips. Real questions score well above this.
 # Calibrated for the local hashing embedder; revisit if the embedder changes.
-_MIN_RELEVANCE_SCORE = 0.1
+# Filtered against the BLENDED hybrid ``rank_score`` (vector + lexical-overlap +
+# definition bonus), not the raw vector score, so a chunk the lexical rescue
+# legitimately reordered to the top also survives this gate. Kept modest so
+# small-talk (which has zero content-words -> rank_score == raw vector score
+# ~0.05) still stays below the floor and surfaces no grounded sources.
+_MIN_RELEVANCE_SCORE = 0.05
 
 # Friendly, brand-neutral reply for greetings/small talk. No sources attached.
 _SMALLTALK_ANSWER = (
@@ -412,8 +417,13 @@ def _retrieve_and_build_prompt(
     hits = search_service.search(
         db, query=cleaned_question, top_k=top_k, owner_id=owner_id, include_global=True
     )
+    # Gate on the blended hybrid ``rank_score`` (fall back to the raw vector
+    # ``score`` for any hit lacking it) so the lexical rescue that reorders a
+    # gold chunk to the top also lets it clear the relevance floor.
     relevant = [
-        hit for hit in hits if float(hit.get("score", 0.0) or 0.0) >= _MIN_RELEVANCE_SCORE
+        hit
+        for hit in hits
+        if float(hit.get("rank_score", hit.get("score", 0.0)) or 0.0) >= _MIN_RELEVANCE_SCORE
     ]
     logger.info(
         "Chat query=%r retrieved %s chunk(s), %s above relevance threshold",

@@ -19,6 +19,7 @@ module level so repeated searches reuse the same (potentially expensive) clients
 
 from __future__ import annotations
 
+import math
 import re
 
 from sqlalchemy import select
@@ -44,12 +45,23 @@ _OVERFETCH_MIN_EXTRA = 5
 # normalization and the best defining chunk can rank well below the vector
 # top_k. We over-fetch a wide pool, then re-rank with a lexical/keyword signal
 # (see _keyword_overlap) so exact-term matches are rescued into top_k.
-_OVERFETCH_MIN_CANDIDATES = 50
+#
+# This floor is deliberately LARGE because, in a multi-tenant store, a few huge
+# admin-global documents (e.g. 2908 + 1552 chunks) otherwise fill the entire
+# pool with their own chunks and a small tenant document's answer chunks never
+# even enter it. A wide pool lets every small-doc chunk in; the per-document cap
+# (see _PER_DOCUMENT_CANDIDATE_CAP) then stops those big docs from re-flooding
+# top_k after re-ranking. Tuned so the small CDN doc's 6 chunks reliably enter.
+_OVERFETCH_MIN_CANDIDATES = 500
 # Weight of the lexical keyword-overlap signal when blended with the vector
-# score: final = vector_score + _KEYWORD_WEIGHT * keyword_overlap. Tuned modestly
-# so it rescues exact terms without overwhelming genuine semantic relevance for
-# paraphrased queries (where overlap is naturally low).
-_KEYWORD_WEIGHT = 0.30
+# score: final = vector_score + _KEYWORD_WEIGHT * weighted_keyword_overlap. The
+# overlap is now IDF-weighted over the candidate pool (see
+# _weighted_keyword_overlap), so a chunk matching the rare discriminative query
+# term decisively beats one matching only ubiquitous words. Raised from 0.30 so
+# that signal can overcome the spuriously-high vector scores the IDF-free
+# embedder assigns large off-topic global-doc chunks, without overwhelming
+# genuine semantic relevance for paraphrased queries (overlap there is low).
+_KEYWORD_WEIGHT = 0.45
 
 # Extra bonus for a chunk that literally INTRODUCES the queried term, i.e. the
 # word "Definition" immediately precedes a query content-term (e.g. "Definition
@@ -61,6 +73,15 @@ _DEFINITION_BONUS = 0.30
 # How many chars before a query term to scan for "definition" (handles PDFs that
 # glue words together, e.g. "Definitionthetranspose").
 _DEFINITION_WINDOW = 32
+
+# Cap on how many candidate chunks any SINGLE document may contribute to the
+# pool before active-filtering/re-ranking. A large global doc (e.g. 2908 chunks)
+# would otherwise flood the over-fetched pool and eject a small tenant doc's best
+# chunks out of top_k entirely. Keeping only each document's strongest chunks
+# preserves tenant isolation (the SQL layer already scopes ownership) while
+# giving smaller docs a fair shot at top_k. Generous enough that genuinely
+# multi-chunk answers from one doc still survive.
+_PER_DOCUMENT_CANDIDATE_CAP = 8
 
 # Word tokenizer shared with the local embedder's notion of a "word".
 _WORD_RE = re.compile(r"[a-z0-9]+")
@@ -82,9 +103,42 @@ _STOPWORDS: frozenset[str] = frozenset(
 )
 
 
+# Light synonym expansion for the keyword-rescue path only. The IDF-free local
+# embedder cannot bridge synonyms, so a "from where can I avail/get/access a CDN"
+# query never lexically matches the document's "Popular CDN Providers" heading
+# (the doc never uses avail/get/access). When any of these intent words appear in
+# the query's content-words, we ADD provider-vocabulary terms so the keyword
+# rescue and overlap signal can reach the provider-listing chunk. This only
+# augments the lexical signal; it never removes the user's own terms.
+_QUERY_SYNONYMS: dict[str, frozenset[str]] = {
+    "avail": frozenset({"providers", "provider", "vendor"}),
+    "get": frozenset({"providers", "provider", "vendor"}),
+    "access": frozenset({"providers", "provider", "vendor"}),
+    "obtain": frozenset({"providers", "provider", "vendor"}),
+    "buy": frozenset({"providers", "provider", "vendor"}),
+    "purchase": frozenset({"providers", "provider", "vendor"}),
+}
+
+
 def _content_words(text: str) -> set[str]:
     """Lowercase content (non-stopword) word tokens of ``text``."""
     return {w for w in _WORD_RE.findall((text or "").lower()) if w not in _STOPWORDS}
+
+
+def _expand_query_words(query_words: set[str]) -> set[str]:
+    """Augment query content-words with light synonym vocabulary (see _QUERY_SYNONYMS).
+
+    Returns the original words plus any mapped provider-vocabulary terms. Never
+    drops a user term. When no synonym trigger is present the set is unchanged,
+    so this is a no-op for the common case and cannot affect small-talk (which
+    has no content words at all).
+    """
+    expanded = set(query_words)
+    for word in query_words:
+        synonyms = _QUERY_SYNONYMS.get(word)
+        if synonyms:
+            expanded |= synonyms
+    return expanded
 
 
 def _keyword_overlap(query_words: set[str], content: str) -> float:
@@ -107,6 +161,60 @@ def _keyword_overlap(query_words: set[str], content: str) -> float:
         return 0.0
     matched = sum(1 for w in query_words if w in lowered)
     return matched / len(query_words)
+
+
+def _pool_idf_weights(query_words: set[str], contents: list[str]) -> dict[str, float]:
+    """Pool-local IDF weight per query term over the candidate ``contents``.
+
+    The hashing embedder has no IDF, so an over-fetched pool dominated by a few
+    huge global documents lets common query words (e.g. "make", "terms",
+    "simple") match many chunks while the one *discriminative* term (e.g. "cdn",
+    which appears only in the small target doc) matches few. A plain
+    :func:`_keyword_overlap` fraction then gives a global chunk that matches two
+    common words MORE credit than the target chunk that matches the single rare
+    term that actually identifies the topic.
+
+    To counter that we compute a cheap IDF over the candidate pool itself:
+    ``idf(term) = ln((N + 1) / (df + 1)) + 1`` where ``df`` is the number of
+    candidate chunks whose (lowercased) content contains ``term``. Rare,
+    topic-defining terms get a high weight; ubiquitous words get a low one. This
+    is the same intuition as classic IDF, just scoped to the live candidate pool
+    (no index, no new dependency). Returns ``{}`` when there are no contents.
+    """
+    if not query_words or not contents:
+        return {}
+    lowered = [(c or "").lower() for c in contents]
+    n = len(lowered)
+    weights: dict[str, float] = {}
+    for term in query_words:
+        df = sum(1 for c in lowered if term in c)
+        weights[term] = math.log((n + 1) / (df + 1)) + 1.0
+    return weights
+
+
+def _weighted_keyword_overlap(
+    query_words: set[str], content: str, idf: dict[str, float]
+) -> float:
+    """IDF-weighted fraction of query terms present in ``content`` (0..1).
+
+    Like :func:`_keyword_overlap` but each matched term contributes its pool-IDF
+    weight (see :func:`_pool_idf_weights`) instead of 1, and the result is
+    normalized by the total possible weight. A chunk matching one rare,
+    discriminative term thus outscores a chunk matching several ubiquitous ones.
+    Falls back to the unweighted fraction when no IDF map is supplied.
+    """
+    if not query_words:
+        return 0.0
+    if not idf:
+        return _keyword_overlap(query_words, content)
+    lowered = (content or "").lower()
+    if not lowered:
+        return 0.0
+    total = sum(idf.get(w, 1.0) for w in query_words)
+    if total <= 0:
+        return 0.0
+    matched = sum(idf.get(w, 1.0) for w in query_words if w in lowered)
+    return matched / total
 
 
 def _is_definition_query(query: str) -> bool:
@@ -227,7 +335,10 @@ def search(
         A list of result dicts, most relevant first, each shaped as::
 
             {document_id, document_name, excerpt, chunk_id, page, score,
-             owner_id, is_global}
+             rank_score, owner_id, is_global}
+
+        ``score`` is the raw vector similarity; ``rank_score`` is the blended
+        hybrid score used for ordering and for the downstream relevance gate.
     """
     query = (query or "").strip()
     if not query:
@@ -276,6 +387,11 @@ def search(
     # for the downstream relevance threshold.
     query_words = _content_words(query)
     if query_words:
+        # Expand with light synonym vocabulary so the lexical rescue can bridge a
+        # phrasing/vocabulary gap (e.g. "avail" -> "providers") the IDF-free
+        # embedder cannot. Used for BOTH the keyword_query pool and the overlap
+        # signal below, so a provider-listing chunk can be injected AND ranked up.
+        query_words = _expand_query_words(query_words)
         try:
             keyword_hits = store.keyword_query(
                 embedding,
@@ -298,11 +414,20 @@ def search(
                     seen_ids.add(kid)
                     hits.append(kh)
 
+        # Pool-local IDF so a discriminative term (e.g. "cdn", present only in the
+        # small target doc) outweighs ubiquitous words ("make", "terms") that
+        # match many chunks of the huge global docs flooding the pool.
+        pool_contents = [
+            str((h.get("metadata") or {}).get("content") or h.get("document") or "")
+            for h in hits
+        ]
+        idf = _pool_idf_weights(query_words, pool_contents)
+
         definition_query = _is_definition_query(query)
         for hit in hits:
             metadata = hit.get("metadata") or {}
             content = str(metadata.get("content") or hit.get("document") or "")
-            overlap = _keyword_overlap(query_words, content)
+            overlap = _weighted_keyword_overlap(query_words, content, idf)
             rank_score = float(hit.get("score", 0.0)) + _KEYWORD_WEIGHT * overlap
             # For a "what is X" query, decisively prefer the chunk that literally
             # defines X (e.g. "Definition The transpose of ...") over the many
@@ -311,6 +436,24 @@ def search(
                 rank_score += _DEFINITION_BONUS
             hit["_rank_score"] = rank_score
         hits = sorted(hits, key=lambda h: h.get("_rank_score", 0.0), reverse=True)
+
+    # Cap per-document contribution so a huge global doc cannot crowd a small
+    # tenant doc out of top_k. Hits are already ordered most-relevant first
+    # (by _rank_score when re-ranked, else by vector score from the store), so
+    # truncating each document_id to its first _PER_DOCUMENT_CANDIDATE_CAP hits
+    # keeps that document's strongest chunks while freeing pool slots for other
+    # documents. Tenant isolation is unaffected (ownership is enforced upstream
+    # in SQL); this only rebalances how many chunks each doc may contribute.
+    per_doc_counts: dict[object, int] = {}
+    capped_hits: list[dict] = []
+    for hit in hits:
+        doc_key = (hit.get("metadata") or {}).get("document_id")
+        count = per_doc_counts.get(doc_key, 0)
+        if count >= _PER_DOCUMENT_CANDIDATE_CAP:
+            continue
+        per_doc_counts[doc_key] = count + 1
+        capped_hits.append(hit)
+    hits = capped_hits
 
     # Batch-resolve the relational rows for active-filtering.
     document_ids: set[int] = set()
@@ -384,7 +527,17 @@ def search(
                 "excerpt": _truncate(str(content)),
                 "chunk_id": chunk_id,
                 "page": page,
+                # Raw vector similarity (kept for any caller that needs the
+                # unblended signal); NOT exposed by the API schema.
                 "score": float(hit.get("score", 0.0)),
+                # Blended hybrid score (vector + lexical-overlap + definition
+                # bonus) used to ORDER results. The downstream relevance gate
+                # filters on THIS so the lexical rescue that reorders a gold
+                # chunk to the top also lets it survive the threshold. Falls
+                # back to the raw vector score when no re-rank ran (no content
+                # words, e.g. small-talk) -> rank_score == score there, so the
+                # gate behaves identically for greetings.
+                "rank_score": float(hit.get("_rank_score", hit.get("score", 0.0))),
                 # Ownership flags (from the authoritative resolved Document row)
                 # so the source builder can apply the own-docs-only display rule.
                 "owner_id": document.owner_id,
