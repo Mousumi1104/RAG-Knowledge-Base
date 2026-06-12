@@ -78,16 +78,40 @@ def _is_no_answer(answer: str) -> bool:
     return any(phrase in norm for phrase in _NO_ANSWER_PHRASES)
 
 # Minimum retrieval similarity for a chunk to count as usable context. Weakly
-# matching hits (e.g. for greetings/small talk like "Hello", which score ~0.05
-# with the local embedder) are dropped so they neither pollute the prompt nor
-# surface as irrelevant source chips. Real questions score well above this.
+# matching hits are dropped so they neither pollute the prompt nor surface as
+# irrelevant source chips. Real questions' best chunk scores well above this.
 # Calibrated for the local hashing embedder; revisit if the embedder changes.
 # Filtered against the BLENDED hybrid ``rank_score`` (vector + lexical-overlap +
 # definition bonus), not the raw vector score, so a chunk the lexical rescue
-# legitimately reordered to the top also survives this gate. Kept modest so
-# small-talk (which has zero content-words -> rank_score == raw vector score
-# ~0.05) still stays below the floor and surfaces no grounded sources.
-_MIN_RELEVANCE_SCORE = 0.05
+# legitimately reordered to the top also survives this gate.
+#
+# Restored to 0.1 (from a brief 0.05 over-reach): because the gate now reads the
+# BLENDED rank_score, even the weakest genuinely-relevant chunk — the paraphrased
+# CDN-provider headline chunk, blended ~0.29-0.37 — clears 0.1 comfortably. The
+# 0.05 floor only admitted low-relevance noise chunks from UNRELATED documents
+# into the LLM context, which the model then parroted. Off-topic exclusion when a
+# strong hit exists is handled by the RELATIVE floor below, not by lowering this.
+_MIN_RELEVANCE_SCORE = 0.1
+
+# Relative (doc-agnostic) relevance floor applied AFTER the absolute gate, so an
+# off-topic chunk from an unrelated document cannot ride into the LLM context
+# alongside a strong on-topic hit. We keep only chunks whose blended rank_score
+# is at least this FRACTION of the top surviving hit's rank_score. The local
+# IDF-free embedder assigns big unrelated documents spuriously-high vector scores
+# that land just below the genuine top hit; measured on the live multi-doc corpus
+# (CDN doc + linear-algebra + statistics globals), real contamination chunks sit
+# at ~0.6-0.95x the top hit while the top hit is reliably the correct on-topic
+# chunk. A high fraction is therefore required to separate them; lower fractions
+# (0.4-0.6) let the noise through. The fraction is relative, so it scales with
+# answer confidence: a high-scoring exact hit keeps only its near-equals, while a
+# weaker hit still keeps its own near-equals (recall preserved -- the gold chunk
+# is always the top hit, so it always survives its own floor).
+_RELATIVE_RELEVANCE_FRACTION = 0.9
+
+# Hard cap on how many chunks may enter the LLM context. Even within the relative
+# floor, a long tail of near-equal chunks dilutes the prompt; the answer lives in
+# the top few. Bounds prompt size and further limits any residual contamination.
+_MAX_CONTEXT_CHUNKS = 3
 
 # Friendly, brand-neutral reply for greetings/small talk. No sources attached.
 _SMALLTALK_ANSWER = (
@@ -193,6 +217,40 @@ def _sanitize_question(question: str) -> str:
     if len(cleaned) > _MAX_QUESTION_CHARS:
         cleaned = cleaned[:_MAX_QUESTION_CHARS].rstrip()
     return cleaned
+
+
+def _select_context(hits: Sequence[Mapping[str, object]]) -> list[dict]:
+    """Select the chunks that may ground the answer (precision-preserving).
+
+    Applies, in order:
+
+    1. ABSOLUTE gate: drop any hit whose blended ``rank_score`` (fallback raw
+       ``score``) is below :data:`_MIN_RELEVANCE_SCORE`.
+    2. RELATIVE floor: of the survivors, keep only those at least
+       :data:`_RELATIVE_RELEVANCE_FRACTION` of the top survivor's rank_score, so
+       an off-topic chunk from an unrelated document cannot ride into context
+       next to a strong on-topic hit.
+    3. CAP: keep at most :data:`_MAX_CONTEXT_CHUNKS` chunks.
+
+    Hits are assumed already ordered most-relevant first by ``search_service``.
+    Tenant isolation and the per-document cap are enforced upstream in
+    ``search_service``; this only trims for relevance, never widens the set.
+    """
+    gated = [
+        hit
+        for hit in hits
+        if float(hit.get("rank_score", hit.get("score", 0.0)) or 0.0) >= _MIN_RELEVANCE_SCORE
+    ]
+    if not gated:
+        return []
+    top_score = float(gated[0].get("rank_score", gated[0].get("score", 0.0)) or 0.0)
+    relative_floor = _RELATIVE_RELEVANCE_FRACTION * top_score
+    selected = [
+        hit
+        for hit in gated
+        if float(hit.get("rank_score", hit.get("score", 0.0)) or 0.0) >= relative_floor
+    ]
+    return selected[:_MAX_CONTEXT_CHUNKS]
 
 
 def _build_sources(hits: Sequence[Mapping[str, object]], owner_id: int) -> list[dict]:
@@ -417,16 +475,15 @@ def _retrieve_and_build_prompt(
     hits = search_service.search(
         db, query=cleaned_question, top_k=top_k, owner_id=owner_id, include_global=True
     )
-    # Gate on the blended hybrid ``rank_score`` (fall back to the raw vector
-    # ``score`` for any hit lacking it) so the lexical rescue that reorders a
-    # gold chunk to the top also lets it clear the relevance floor.
-    relevant = [
-        hit
-        for hit in hits
-        if float(hit.get("rank_score", hit.get("score", 0.0)) or 0.0) >= _MIN_RELEVANCE_SCORE
-    ]
+    # Select context on the blended hybrid ``rank_score``: an absolute relevance
+    # gate, then a relative (fraction-of-top) floor so off-topic chunks from
+    # unrelated docs can't ride into context beside a strong hit, then a cap.
+    # (See :func:`_select_context`.) The lexical rescue that reorders a gold
+    # chunk to the top means that chunk both clears the gate and anchors the
+    # relative floor, so recall is preserved while contamination is excluded.
+    relevant = _select_context(hits)
     logger.info(
-        "Chat query=%r retrieved %s chunk(s), %s above relevance threshold",
+        "Chat query=%r retrieved %s chunk(s), %s selected for context",
         cleaned_question,
         len(hits),
         len(relevant),
