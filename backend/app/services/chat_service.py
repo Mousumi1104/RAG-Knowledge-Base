@@ -93,24 +93,33 @@ def _is_no_answer(answer: str) -> bool:
 # strong hit exists is handled by the RELATIVE floor below, not by lowering this.
 _MIN_RELEVANCE_SCORE = 0.1
 
-# Relative (doc-agnostic) relevance floor applied AFTER the absolute gate, so an
-# off-topic chunk from an unrelated document cannot ride into the LLM context
-# alongside a strong on-topic hit. We keep only chunks whose blended rank_score
-# is at least this FRACTION of the top surviving hit's rank_score. The local
-# IDF-free embedder assigns big unrelated documents spuriously-high vector scores
-# that land just below the genuine top hit; measured on the live multi-doc corpus
-# (CDN doc + linear-algebra + statistics globals), real contamination chunks sit
-# at ~0.6-0.95x the top hit while the top hit is reliably the correct on-topic
-# chunk. A high fraction is therefore required to separate them; lower fractions
-# (0.4-0.6) let the noise through. The fraction is relative, so it scales with
-# answer confidence: a high-scoring exact hit keeps only its near-equals, while a
-# weaker hit still keeps its own near-equals (recall preserved -- the gold chunk
-# is always the top hit, so it always survives its own floor).
-_RELATIVE_RELEVANCE_FRACTION = 0.9
+# DOCUMENT-AWARE relative relevance floors, applied AFTER the absolute gate, so
+# an off-topic chunk from an unrelated document cannot ride into the LLM context
+# alongside a strong on-topic hit. A chunk is kept only if its blended rank_score
+# is at least the relevant FRACTION of the TOP surviving hit's rank_score:
+#
+#   * same document as the top hit -> _SAME_DOC_RELEVANCE_FRACTION (loose), so a
+#     genuine multi-chunk answer that spans several chunks of the SAME document
+#     (e.g. a CDN question answered by two adjacent CDN chunks) is preserved.
+#   * a DIFFERENT document -> _CROSS_DOC_RELEVANCE_FRACTION (near-1.0, strict), so
+#     a chunk from another document must essentially TIE the top hit to enter.
+#
+# Rationale (measured on the live multi-doc corpus: CDN doc + linear-algebra +
+# statistics globals): the local IDF-free embedder assigns big unrelated
+# documents spuriously-high vector scores that land just BELOW the genuine top
+# hit (~0.6-0.96x). A single doc-agnostic fraction cannot separate these from
+# legitimate same-doc secondary chunks, which sit in the same band. But the top
+# hit is reliably the correct on-topic chunk, and no off-topic-doc chunk ever
+# actually EXCEEDS it -- so requiring cross-document chunks to nearly tie the top
+# drops all cross-doc contamination to zero while the loose same-doc floor keeps
+# multi-chunk answers. Recall is preserved: the gold chunk is always the top hit,
+# always same-document-as-itself, and always clears its own loose floor.
+_SAME_DOC_RELEVANCE_FRACTION = 0.8
+_CROSS_DOC_RELEVANCE_FRACTION = 0.98
 
-# Hard cap on how many chunks may enter the LLM context. Even within the relative
-# floor, a long tail of near-equal chunks dilutes the prompt; the answer lives in
-# the top few. Bounds prompt size and further limits any residual contamination.
+# Hard cap on how many chunks may enter the LLM context. Even within the floors,
+# a long tail of near-equal chunks dilutes the prompt; the answer lives in the
+# top few. Bounds prompt size and further limits any residual noise.
 _MAX_CONTEXT_CHUNKS = 3
 
 # Friendly, brand-neutral reply for greetings/small talk. No sources attached.
@@ -226,31 +235,36 @@ def _select_context(hits: Sequence[Mapping[str, object]]) -> list[dict]:
 
     1. ABSOLUTE gate: drop any hit whose blended ``rank_score`` (fallback raw
        ``score``) is below :data:`_MIN_RELEVANCE_SCORE`.
-    2. RELATIVE floor: of the survivors, keep only those at least
-       :data:`_RELATIVE_RELEVANCE_FRACTION` of the top survivor's rank_score, so
-       an off-topic chunk from an unrelated document cannot ride into context
-       next to a strong on-topic hit.
+    2. DOCUMENT-AWARE relative floor: of the survivors, keep a chunk from the SAME
+       document as the top hit when its rank_score is at least
+       :data:`_SAME_DOC_RELEVANCE_FRACTION` of the top's, but require a chunk from
+       a DIFFERENT document to clear the stricter
+       :data:`_CROSS_DOC_RELEVANCE_FRACTION`. This keeps multi-chunk same-doc
+       answers while excluding off-topic chunks from unrelated documents.
     3. CAP: keep at most :data:`_MAX_CONTEXT_CHUNKS` chunks.
 
     Hits are assumed already ordered most-relevant first by ``search_service``.
     Tenant isolation and the per-document cap are enforced upstream in
     ``search_service``; this only trims for relevance, never widens the set.
     """
-    gated = [
-        hit
-        for hit in hits
-        if float(hit.get("rank_score", hit.get("score", 0.0)) or 0.0) >= _MIN_RELEVANCE_SCORE
-    ]
+    def rank(hit: Mapping[str, object]) -> float:
+        return float(hit.get("rank_score", hit.get("score", 0.0)) or 0.0)
+
+    gated = [hit for hit in hits if rank(hit) >= _MIN_RELEVANCE_SCORE]
     if not gated:
         return []
-    top_score = float(gated[0].get("rank_score", gated[0].get("score", 0.0)) or 0.0)
-    relative_floor = _RELATIVE_RELEVANCE_FRACTION * top_score
-    selected = [
-        hit
-        for hit in gated
-        if float(hit.get("rank_score", hit.get("score", 0.0)) or 0.0) >= relative_floor
-    ]
-    return selected[:_MAX_CONTEXT_CHUNKS]
+    top = gated[0]
+    top_score = rank(top)
+    top_doc_id = top.get("document_id")
+    selected: list[dict] = []
+    for hit in gated:
+        same_doc = hit.get("document_id") == top_doc_id
+        fraction = _SAME_DOC_RELEVANCE_FRACTION if same_doc else _CROSS_DOC_RELEVANCE_FRACTION
+        if rank(hit) >= fraction * top_score:
+            selected.append(dict(hit))
+        if len(selected) >= _MAX_CONTEXT_CHUNKS:
+            break
+    return selected
 
 
 def _build_sources(hits: Sequence[Mapping[str, object]], owner_id: int) -> list[dict]:
