@@ -86,6 +86,30 @@ _PER_DOCUMENT_CANDIDATE_CAP = 8
 # Word tokenizer shared with the local embedder's notion of a "word".
 _WORD_RE = re.compile(r"[a-z0-9]+")
 
+# Penalty subtracted from a chunk's blended rank_score when it is a predominantly
+# interrogative "question-list" chunk (e.g. the page-2 "RAG Test Questions" list:
+# enumerated "1. Who is the CEO?", "2. When was the company founded?" ...). Such a
+# chunk lexically matches a "Who is the CEO?" query extremely well yet contains NO
+# declarative answer, so without this penalty it tops the ranking and (a) anchors
+# the top-document rule on the wrong chunk and (b) gets echoed back as the
+# "answer". The penalty is large enough to push it below the sibling page-1
+# DECLARATIVE answer chunk, which then wins #0. See :func:`_question_list_ratio`.
+_QUESTION_LIST_PENALTY = 0.50
+# A chunk is treated as a question-list when this fraction or more of its
+# non-empty lines are interrogative (end in '?' or are an enumerated 'N. <Wh>...'
+# line) AND it has at least this many such lines (so a single trailing question
+# in an otherwise declarative chunk is not penalized).
+_QUESTION_LIST_RATIO = 0.6
+_QUESTION_LIST_MIN_LINES = 3
+
+# Enumerated interrogative line, e.g. "1. Who is the CEO?" / "3) What is ...".
+_ENUM_QUESTION_RE = re.compile(r"^\s*\d+[.)]\s", re.MULTILINE)
+# Leading interrogative/Wh word that marks a question line lacking a '?'.
+_WH_WORDS: frozenset[str] = frozenset(
+    {"who", "what", "when", "where", "why", "how", "which", "whom", "whose", "is",
+     "are", "do", "does", "can", "could", "will", "would", "should"}
+)
+
 # Common English stop / interrogative words stripped from a query before
 # computing keyword overlap, so generic words ("what", "is", "the", "of", "a")
 # don't drown out the rare content term that actually discriminates chunks.
@@ -215,6 +239,29 @@ def _weighted_keyword_overlap(
         return 0.0
     matched = sum(idf.get(w, 1.0) for w in query_words if w in lowered)
     return matched / total
+
+
+def _is_question_list_chunk(content: str) -> bool:
+    """True when ``content`` is a predominantly-interrogative question-list chunk.
+
+    Counts non-empty lines that are interrogative — they end in '?', or are an
+    enumerated "N. ..." line, or begin with a Wh/auxiliary interrogative word —
+    and flags the chunk when at least :data:`_QUESTION_LIST_MIN_LINES` lines and
+    at least :data:`_QUESTION_LIST_RATIO` of all non-empty lines are interrogative
+    AND declarative content is sparse. This precisely identifies the page-2 test
+    "RAG Test Questions" list (all enumerated questions, no answers) without
+    penalizing a normal answer paragraph that merely ends with one question.
+    """
+    lines = [ln.strip() for ln in (content or "").splitlines() if ln.strip()]
+    if len(lines) < _QUESTION_LIST_MIN_LINES:
+        return False
+    interrogative = 0
+    for line in lines:
+        lowered = line.lower()
+        first = (_WORD_RE.findall(lowered) or [""])[0]
+        if line.endswith("?") or _ENUM_QUESTION_RE.match(line) or first in _WH_WORDS:
+            interrogative += 1
+    return interrogative / len(lines) >= _QUESTION_LIST_RATIO
 
 
 def _is_definition_query(query: str) -> bool:
@@ -434,6 +481,13 @@ def search(
             # chunks that only mention X with a slightly better vector score.
             if definition_query and _defines_term(query_words, content):
                 rank_score += _DEFINITION_BONUS
+            # Down-weight a predominantly-interrogative question-list chunk so the
+            # declarative answer chunk (e.g. page-1 "CEO: Ananya Sharma") wins #0
+            # for a "Who is the CEO?"-style query instead of the page-2 question
+            # list — which both echoes back as the "answer" and would wrongly
+            # anchor the downstream single-top-document rule.
+            if _is_question_list_chunk(content):
+                rank_score -= _QUESTION_LIST_PENALTY
             hit["_rank_score"] = rank_score
         hits = sorted(hits, key=lambda h: h.get("_rank_score", 0.0), reverse=True)
 

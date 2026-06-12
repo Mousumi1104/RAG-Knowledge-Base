@@ -31,13 +31,28 @@ from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-# Retry/backoff tuning for rate-limited cloud calls (kept short and safe).
-_MAX_RETRIES = 2
-_BACKOFF_BASE_SECONDS = 0.5
+# Retry/backoff tuning for rate-limited cloud calls. The Gemini free tier returns
+# 429 readily (low RPM), so we retry a few times with exponential backoff before
+# the caller falls back to the local extractive provider.
+_MAX_RETRIES = 4
+_BACKOFF_BASE_SECONDS = 1.0
 
 # Sentence splitter for the local extractive provider.
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 _WORD_RE = re.compile(r"[a-z0-9]+")
+
+# Leading interrogative ("Wh"/auxiliary) words that, together with a trailing
+# '?' or an enumerated "N. ..." prefix, mark a line as a QUESTION rather than a
+# declarative answer. Used by the local extractive provider to skip sentences
+# that merely echo the user's question (e.g. a page-2 "RAG Test Questions" list
+# chunk that landed in context) instead of answering it.
+_INTERROGATIVE_WORDS: frozenset[str] = frozenset(
+    {"who", "what", "when", "where", "why", "how", "which", "whom", "whose",
+     "is", "are", "do", "does", "can", "could", "will", "would", "should",
+     "did", "was", "were", "shall"}
+)
+# Enumerated list prefix, e.g. "1. Who is the CEO?" / "3) What is ...".
+_ENUM_PREFIX_RE = re.compile(r"^\s*\d+[.)]\s")
 
 _NO_CONTEXT_MESSAGE = "I couldn't find relevant information in the knowledge base."
 
@@ -106,12 +121,26 @@ class LocalExtractiveLLMProvider(LLMProvider):
         if not sentences:
             return _NO_CONTEXT_MESSAGE
 
-        ranked = self._rank_sentences(sentences, question)
+        # Drop sentences that are themselves questions / near-duplicates of the
+        # user's question. When the only context is a question-list chunk (e.g.
+        # the page-2 "RAG Test Questions" list), every sentence is interrogative,
+        # so this leaves nothing declarative and we abstain below instead of
+        # echoing the question back as the "answer".
+        declarative = [s for s in sentences if not self._is_question_like(s, question)]
+        if not declarative:
+            # Nothing groundable remains after removing question-echo lines.
+            return _NO_CONTEXT_MESSAGE
+
+        ranked = self._rank_sentences(declarative, question)
         if not ranked:
-            # No lexical overlap; quote the first context sentences as a fallback.
-            ranked = sentences[: self._MAX_SENTENCES]
+            # No declarative sentence shares any content term with the question.
+            # The only "context" is off-topic prose / list scaffolding (headings,
+            # enumeration markers), so abstain rather than quote noise back.
+            return _NO_CONTEXT_MESSAGE
 
         answer = " ".join(ranked[: self._MAX_SENTENCES]).strip()
+        if not answer:
+            return _NO_CONTEXT_MESSAGE
         if len(answer) > self._MAX_ANSWER_CHARS:
             answer = answer[: self._MAX_ANSWER_CHARS].rstrip() + "..."
 
@@ -167,6 +196,54 @@ class LocalExtractiveLLMProvider(LLMProvider):
                 if cleaned:
                     sentences.append(cleaned)
         return sentences
+
+    @staticmethod
+    def _is_question_like(sentence: str, question: str) -> bool:
+        """True when ``sentence`` is interrogative or echoes the user's question.
+
+        A sentence is treated as a non-answer (to be skipped) when it is itself a
+        question — it ends with '?', is an enumerated "N. <Wh>..." list line, or
+        begins with a Wh/auxiliary interrogative word — OR when it is a near-
+        duplicate of the user's own question (very high token overlap and a
+        near-identical length). This stops the provider from quoting back a
+        question-list chunk's lines (e.g. "1. Who is the CEO?") instead of the
+        declarative answer ("CEO: Ananya Sharma"). It never drops a genuine
+        declarative answer line such as "CEO: Ananya Sharma" or "Hotel
+        reimbursement limit: ₹5000 per night".
+        """
+        text = (sentence or "").strip()
+        if not text:
+            return True
+        lowered = text.lower()
+        first = (_WORD_RE.findall(lowered) or [""])[0]
+        # Enumerated "N. Who/What ..." line or any line starting with a Wh/aux
+        # word, or any line ending in a question mark, is interrogative.
+        if _ENUM_PREFIX_RE.match(text):
+            # Strip the enumeration prefix and re-test the leading word so that
+            # "1. Who is the CEO?" is caught but "1. Annual 24 days" is not.
+            rest = _ENUM_PREFIX_RE.sub("", text, count=1)
+            rest_first = (_WORD_RE.findall(rest.lower()) or [""])[0]
+            if text.endswith("?") or rest_first in _INTERROGATIVE_WORDS:
+                return True
+        if text.endswith("?"):
+            return True
+        if first in _INTERROGATIVE_WORDS and " " in text:
+            return True
+        # Near-duplicate of the user's question: the sentence and the question
+        # share almost the SAME token set (symmetric / Jaccard overlap), not
+        # merely "all query tokens appear in the sentence" — otherwise a short
+        # declarative answer like "CEO: Ananya Sharma" (which contains the query's
+        # only content term "ceo") would be wrongly dropped for a "...CEO...?"
+        # query. A genuine echo (e.g. the line "Who is the CEO?") has a near-
+        # identical token set AND a near-identical length.
+        s_terms = set(_WORD_RE.findall(lowered))
+        q_terms = set(_WORD_RE.findall((question or "").lower()))
+        if q_terms and s_terms:
+            jaccard = len(q_terms & s_terms) / len(q_terms | s_terms)
+            len_ratio = min(len(text), len(question)) / max(len(text), len(question), 1)
+            if jaccard >= 0.8 and len_ratio >= 0.7:
+                return True
+        return False
 
     @staticmethod
     def _rank_sentences(sentences: list[str], question: str) -> list[str]:

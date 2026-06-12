@@ -23,6 +23,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.database.base import Status
 from app.database.session import SessionLocal
 from app.models.conversation import Conversation
@@ -93,34 +94,53 @@ def _is_no_answer(answer: str) -> bool:
 # strong hit exists is handled by the RELATIVE floor below, not by lowering this.
 _MIN_RELEVANCE_SCORE = 0.1
 
-# DOCUMENT-AWARE relative relevance floors, applied AFTER the absolute gate, so
-# an off-topic chunk from an unrelated document cannot ride into the LLM context
-# alongside a strong on-topic hit. A chunk is kept only if its blended rank_score
-# is at least the relevant FRACTION of the TOP surviving hit's rank_score:
+# TOP-DOCUMENT relevance rule, applied AFTER the absolute gate. Only chunks from
+# the SINGLE best-scoring chunk's document may ground the answer; chunks from any
+# OTHER document are dropped outright. This replaces the old cross-document
+# relative floor (which let a weak ~0.31 global chunk that merely TIED a weak top
+# hit anchor a whole context) with a hard single-document rule plus an absolute
+# floor on the anchor (see _top_doc_min_rank_score):
 #
-#   * same document as the top hit -> _SAME_DOC_RELEVANCE_FRACTION (loose), so a
-#     genuine multi-chunk answer that spans several chunks of the SAME document
-#     (e.g. a CDN question answered by two adjacent CDN chunks) is preserved.
-#   * a DIFFERENT document -> _CROSS_DOC_RELEVANCE_FRACTION (near-1.0, strict), so
-#     a chunk from another document must essentially TIE the top hit to enter.
-#
-# Rationale (measured on the live multi-doc corpus: CDN doc + linear-algebra +
-# statistics globals): the local IDF-free embedder assigns big unrelated
-# documents spuriously-high vector scores that land just BELOW the genuine top
-# hit (~0.6-0.96x). A single doc-agnostic fraction cannot separate these from
-# legitimate same-doc secondary chunks, which sit in the same band. But the top
-# hit is reliably the correct on-topic chunk, and no off-topic-doc chunk ever
-# actually EXCEEDS it -- so requiring cross-document chunks to nearly tie the top
-# drops all cross-doc contamination to zero while the loose same-doc floor keeps
-# multi-chunk answers. Recall is preserved: the gold chunk is always the top hit,
-# always same-document-as-itself, and always clears its own loose floor.
-_SAME_DOC_RELEVANCE_FRACTION = 0.8
-_CROSS_DOC_RELEVANCE_FRACTION = 0.98
+#   * The answer to any one question lives in one document. Admitting only the
+#     top document's chunks eliminates cross-document contamination entirely.
+#   * Among same-document survivors we DO NOT apply a relative (fraction-of-top)
+#     floor: the page-1 answer chunk and the page-2 question-list chunk are the
+#     SAME document, and when the question-list chunk happens to top the ranking
+#     a 0.8*top relative floor would evict the lower-scoring page-1 ANSWER chunk —
+#     the very chunk we need. Instead every same-document survivor that cleared
+#     the absolute gate is admitted, up to the cap. The search layer already
+#     down-weights interrogative question-list chunks so the declarative answer
+#     chunk anchors the top document.
 
-# Hard cap on how many chunks may enter the LLM context. Even within the floors,
+# Absolute floor the TOP (anchor) chunk's blended rank_score must clear for ANY
+# context to be admitted. A genuine on-topic hit scores comfortably above this;
+# a weak ~0.31 global near-miss does not. If the best chunk is below this floor
+# we admit no context at all and let the model abstain, rather than letting a
+# weak chunk drag a whole (wrong) document into the prompt.
+#
+# Provider-aware: the floor lives in the blended rank_score space, whose magnitude
+# depends on the embedder. The Gemini (cosine, semantic) embedder puts genuine
+# hits at ~0.6-1.1 and off-topic near-misses at ~0.3, so 0.40 cleanly separates
+# them. The local hashing embedder (IDF-free, no semantics) compresses everything
+# into ~0.1-0.3, where a real on-topic chunk can sit at ~0.26; there a 0.40 floor
+# would reject genuine answers. For the local embedder we therefore fall back to
+# the looser absolute gate (:data:`_MIN_RELEVANCE_SCORE`), preserving the prior
+# behavior; the strict anchor only engages for the semantic Gemini space.
+_TOP_DOC_MIN_RANK_SCORE_GEMINI = 0.40
+
+
+def _top_doc_min_rank_score() -> float:
+    """Anchor-floor for the active embedder (strict for Gemini, loose for local)."""
+    if (settings.EMBEDDING_PROVIDER or "local").strip().lower() == "gemini":
+        return _TOP_DOC_MIN_RANK_SCORE_GEMINI
+    return _MIN_RELEVANCE_SCORE
+
+# Hard cap on how many chunks may enter the LLM context. Even within one document
 # a long tail of near-equal chunks dilutes the prompt; the answer lives in the
-# top few. Bounds prompt size and further limits any residual noise.
-_MAX_CONTEXT_CHUNKS = 3
+# top few. Raised 3 -> 5 so multi-fact answers (e.g. "summarize all reimbursement
+# policies", which spans several handbook lines) have enough room. Bounds prompt
+# size and limits residual noise.
+_MAX_CONTEXT_CHUNKS = 5
 
 # Friendly, brand-neutral reply for greetings/small talk. No sources attached.
 _SMALLTALK_ANSWER = (
@@ -235,12 +255,13 @@ def _select_context(hits: Sequence[Mapping[str, object]]) -> list[dict]:
 
     1. ABSOLUTE gate: drop any hit whose blended ``rank_score`` (fallback raw
        ``score``) is below :data:`_MIN_RELEVANCE_SCORE`.
-    2. DOCUMENT-AWARE relative floor: of the survivors, keep a chunk from the SAME
-       document as the top hit when its rank_score is at least
-       :data:`_SAME_DOC_RELEVANCE_FRACTION` of the top's, but require a chunk from
-       a DIFFERENT document to clear the stricter
-       :data:`_CROSS_DOC_RELEVANCE_FRACTION`. This keeps multi-chunk same-doc
-       answers while excluding off-topic chunks from unrelated documents.
+    2. TOP-DOCUMENT + absolute-anchor rule: the top surviving hit's rank_score
+       must clear :func:`_top_doc_min_rank_score`, else return no context (let the
+       model abstain rather than let a weak chunk anchor a wrong document). When
+       it does clear, admit ONLY chunks from that top hit's document — every
+       same-document survivor that passed the absolute gate, with NO relative
+       fraction-of-top floor, so the page-1 answer chunk is never evicted by a
+       higher-scoring page-2 question-list sibling.
     3. CAP: keep at most :data:`_MAX_CONTEXT_CHUNKS` chunks.
 
     Hits are assumed already ordered most-relevant first by ``search_service``.
@@ -254,14 +275,19 @@ def _select_context(hits: Sequence[Mapping[str, object]]) -> list[dict]:
     if not gated:
         return []
     top = gated[0]
-    top_score = rank(top)
+    # Require the anchor chunk to clear an absolute floor; a weak near-miss must
+    # not drag its whole document into the prompt. The floor is provider-aware
+    # (strict for the semantic Gemini space, loose for the local embedder).
+    if rank(top) < _top_doc_min_rank_score():
+        return []
     top_doc_id = top.get("document_id")
     selected: list[dict] = []
     for hit in gated:
-        same_doc = hit.get("document_id") == top_doc_id
-        fraction = _SAME_DOC_RELEVANCE_FRACTION if same_doc else _CROSS_DOC_RELEVANCE_FRACTION
-        if rank(hit) >= fraction * top_score:
-            selected.append(dict(hit))
+        # Single-document context only: chunks from any other document are
+        # off-topic contamination and dropped outright.
+        if hit.get("document_id") != top_doc_id:
+            continue
+        selected.append(dict(hit))
         if len(selected) >= _MAX_CONTEXT_CHUNKS:
             break
     return selected

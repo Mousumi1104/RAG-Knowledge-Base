@@ -62,6 +62,17 @@ def _local_path(file_path: str, document_type: str) -> Iterator[str]:
 # Control characters except common whitespace (tab, newline, carriage return).
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
+# Rupee-sign recovery: the Indian rupee glyph ₹ (U+20B9) is not present in
+# ``WinAnsiEncoding``, so pypdf cannot decode it from PDFs whose Helvetica font
+# declares that encoding (the common case for ₹ amounts). It surfaces instead as
+# the filled-square replacement glyph ■ (U+25A0) sitting immediately before the
+# numeric amount (e.g. "limit: ■5000 per night"). We remap a ■ that directly
+# precedes a digit (optionally across a single space) back to ₹ so currency
+# amounts survive extraction and become searchable/answerable. This is narrowly
+# targeted at the corruption pattern (box-then-digit); a standalone ■ used as a
+# real bullet/checkbox glyph is left untouched.
+_RUPEE_BOX_RE = re.compile(r"■(\s?)(\d)")
+
 
 def _extract_pdf_pages(file_path: str) -> list[str]:
     """Return per-page raw text for a PDF (one string per page, in order)."""
@@ -175,6 +186,8 @@ def clean_text(text: str) -> str:
     text = unicodedata.normalize("NFKC", text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = _CONTROL_CHARS.sub("", text)
+    # Recover ₹ amounts that pypdf decoded as the ■ box glyph (see _RUPEE_BOX_RE).
+    text = _RUPEE_BOX_RE.sub(r"₹\1\2", text)
 
     # Collapse horizontal whitespace and trim each line.
     lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.split("\n")]

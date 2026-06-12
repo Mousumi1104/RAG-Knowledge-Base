@@ -1,12 +1,18 @@
 """Embedding provider abstraction and concrete implementations.
 
-Three providers are available, selected via ``settings.EMBEDDING_PROVIDER``:
+Four providers are available, selected via ``settings.EMBEDDING_PROVIDER``:
 
 - :class:`LocalHashingEmbeddingProvider` (default) — deterministic, dependency-light
   hashing/n-gram embedder. No torch / sentence-transformers; uses only stdlib
   hashing (``blake2b``) plus numpy for the math. Deterministic across processes
   because it relies on ``blake2b`` (NOT Python's salted ``hash()``).
 - :class:`OpenAIEmbeddingProvider` — calls the OpenAI embeddings API over httpx.
+- :class:`GeminiEmbeddingProvider` — calls Google's Generative Language
+  embeddings API (``gemini-embedding-001``) over httpx, requesting a 384-dim
+  output so it drops straight into the existing ``Vector(384)`` column. Unlike
+  the local hashing embedder, it produces genuinely multilingual vectors
+  (Hindi/Bengali queries match English source text), which is why it is the
+  provider of choice for the multilingual scorecard.
 - :class:`AnthropicCompatibleEmbeddingProvider` — Anthropic has **no public
   embeddings API**. Rather than failing hard, this provider logs a warning and
   delegates to the local hashing provider so the app always runs.
@@ -19,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 from abc import ABC, abstractmethod
 
 import numpy as np
@@ -181,6 +188,125 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         return self._request([text])[0]
 
 
+class GeminiEmbeddingProvider(EmbeddingProvider):
+    """Google Gemini embeddings provider via the Generative Language REST API.
+
+    Calls ``gemini-embedding-001:embedContent`` over httpx, mirroring
+    :class:`app.rag.llm.GeminiLLMProvider` for auth (the API key rides in the
+    ``x-goog-api-key`` header, kept out of the URL/logs), base URL and the short
+    exponential backoff on 429.
+
+    Dimensionality: the model natively emits 3072-dim vectors, but the API's
+    ``outputDimensionality`` parameter lets us request exactly
+    ``settings.EMBEDDING_DIM`` (384). That keeps the existing pgvector
+    ``Vector(384)`` column intact — NO migration. Gemini does not L2-normalize
+    truncated outputs itself, so we re-normalize each vector here to keep cosine
+    similarity well-behaved (consistent with the other providers).
+
+    Task types: chunk embeddings use ``RETRIEVAL_DOCUMENT`` and query embeddings
+    use ``RETRIEVAL_QUERY``, the asymmetric pairing Gemini recommends for
+    retrieval. The API embeds one content per request, so a batch is issued as a
+    sequence of single calls (paced by the shared backoff on rate limits).
+
+    On a persistent 429 the provider raises :class:`RateLimitError` rather than
+    silently returning anything — a hash-vector fallback would mix incompatible
+    embedding spaces and quietly destroy retrieval, so the caller must see the
+    error instead.
+    """
+
+    _MODEL = "gemini-embedding-001"
+    _BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+    _TIMEOUT = 30.0
+    # Short exponential backoff on 429, matching app.rag.llm's tuning.
+    _MAX_RETRIES = 4
+    _BACKOFF_BASE_SECONDS = 0.5
+
+    def __init__(self, api_key: str, dim: int | None = None) -> None:
+        if not api_key:
+            raise ValueError("GeminiEmbeddingProvider requires an API key")
+        self._api_key = api_key
+        self._dim = int(dim if dim is not None else settings.EMBEDDING_DIM)
+
+    @property
+    def dim(self) -> int:
+        return self._dim
+
+    def _embed_one(self, text: str, task_type: str) -> list[float]:
+        """Embed a single text with the given Gemini ``task_type``.
+
+        Retries with exponential backoff on 429; raises on persistent rate
+        limiting or any other API/transport error (never returns a fallback
+        vector from an incompatible space).
+        """
+        import httpx
+
+        url = f"{self._BASE}/{self._MODEL}:embedContent"
+        headers = {"Content-Type": "application/json", "x-goog-api-key": self._api_key}
+        payload = {
+            "model": f"models/{self._MODEL}",
+            "content": {"parts": [{"text": text or ""}]},
+            "taskType": task_type,
+            "outputDimensionality": self._dim,
+        }
+
+        last_exc: Exception | None = None
+        for attempt in range(self._MAX_RETRIES + 1):
+            try:
+                response = httpx.post(url, headers=headers, json=payload, timeout=self._TIMEOUT)
+            except httpx.HTTPError as exc:
+                logger.error("Gemini embeddings request failed: %s", exc)
+                raise ProviderError("Gemini embeddings request failed") from exc
+
+            if response.status_code == 429:
+                last_exc = RateLimitError("Gemini embeddings rate limit exceeded")
+                if attempt < self._MAX_RETRIES:
+                    delay = self._BACKOFF_BASE_SECONDS * (2**attempt)
+                    logger.warning(
+                        "Gemini embeddings rate limited (attempt %s); retrying in %.1fs",
+                        attempt + 1,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise last_exc
+            if response.status_code >= 400:
+                logger.error(
+                    "Gemini embeddings error %s: %s",
+                    response.status_code,
+                    response.text[:500],
+                )
+                raise ProviderError(
+                    f"Gemini embeddings error (status {response.status_code})"
+                )
+
+            try:
+                values = response.json()["embedding"]["values"]
+            except (KeyError, IndexError, TypeError, ValueError) as exc:
+                logger.error("Unexpected Gemini embeddings response shape: %s", exc)
+                raise ProviderError("Gemini returned an unexpected embeddings response") from exc
+            return self._normalize(values)
+
+        # Defensive: only reached if the loop exits without returning/raising.
+        raise last_exc or ProviderError("Gemini embeddings request failed")
+
+    @staticmethod
+    def _normalize(values: list[float]) -> list[float]:
+        """L2-normalize a vector (truncated MRL outputs are not unit-norm)."""
+        vector = np.asarray(values, dtype=np.float32)
+        norm = float(np.linalg.norm(vector))
+        if norm > 0.0:
+            vector = vector / norm
+        return vector.astype(np.float32).tolist()
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        return [self._embed_one(text, "RETRIEVAL_DOCUMENT") for text in texts]
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._embed_one(text, "RETRIEVAL_QUERY")
+
+
 class AnthropicCompatibleEmbeddingProvider(EmbeddingProvider):
     """Anthropic-compatible embeddings provider.
 
@@ -215,6 +341,8 @@ def get_embedding_provider() -> EmbeddingProvider:
     - ``local`` (default): :class:`LocalHashingEmbeddingProvider`.
     - ``openai``: :class:`OpenAIEmbeddingProvider` if ``OPENAI_API_KEY`` is set,
       otherwise a warning is logged and the local provider is used.
+    - ``gemini``: :class:`GeminiEmbeddingProvider` if ``GEMINI_API_KEY`` is set,
+      otherwise a warning is logged and the local provider is used (keyless boot).
     - ``anthropic``: :class:`AnthropicCompatibleEmbeddingProvider` (delegates to
       local).
     - any unknown value: warns and uses the local provider.
@@ -227,6 +355,16 @@ def get_embedding_provider() -> EmbeddingProvider:
             return OpenAIEmbeddingProvider(api_key=settings.OPENAI_API_KEY)
         logger.warning(
             "EMBEDDING_PROVIDER=openai but OPENAI_API_KEY is missing; "
+            "falling back to the local hashing embedder."
+        )
+        return LocalHashingEmbeddingProvider()
+
+    if provider == "gemini":
+        if settings.GEMINI_API_KEY:
+            logger.info("Using Gemini embedding provider (dim=%s)", settings.EMBEDDING_DIM)
+            return GeminiEmbeddingProvider(api_key=settings.GEMINI_API_KEY)
+        logger.warning(
+            "EMBEDDING_PROVIDER=gemini but GEMINI_API_KEY is missing; "
             "falling back to the local hashing embedder."
         )
         return LocalHashingEmbeddingProvider()
