@@ -27,7 +27,7 @@ services:
     envVars:
       # --- Non-secret configuration (safe to commit) -----------------------
       - key: EMBEDDING_PROVIDER
-        value: local
+        value: gemini
       - key: EMBEDDING_DIM
         value: "384"
       - key: VECTOR_DB
@@ -35,7 +35,7 @@ services:
       - key: LLM_PROVIDER
         value: gemini
       - key: GEMINI_MODEL
-        value: gemini-2.5-flash
+        value: gemini-2.5-flash-lite
       - key: JWT_ALGORITHM
         value: HS256
       - key: ACCESS_TOKEN_EXPIRE_MINUTES
