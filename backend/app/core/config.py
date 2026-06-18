@@ -37,6 +37,20 @@ class Settings(BaseSettings):
     # Google Gemini (free tier via Google AI Studio: https://aistudio.google.com/apikey).
     GEMINI_API_KEY: str | None = None
     GEMINI_MODEL: str = "gemini-2.5-flash"
+    # --- Gemini embedding rate limiting -----------------------------------
+    # The free tier embedContent endpoint embeds one chunk per request and caps
+    # at ~15 requests/minute. An 80-page PDF (~240 chunks) issued back-to-back
+    # blows past that and 429s the whole index job. We therefore pace requests to
+    # a configurable RPM budget (kept safely under 15) and back off harder on the
+    # 429s that still slip through, honoring server-provided Retry-After hints.
+    GEMINI_EMBED_RPM: int = 10
+    GEMINI_EMBED_MAX_RETRIES: int = 6
+    GEMINI_EMBED_BACKOFF_BASE_SECONDS: float = 0.5
+    GEMINI_EMBED_MAX_BACKOFF_SECONDS: float = 60.0
+    # A paced 240-chunk doc at 10 RPM takes ~24 min, so the stale-processing sweep
+    # must allow a generous margin or it would mark a healthy-but-slow job 'failed'
+    # on a worker restart. Minutes after which a stuck 'processing' doc is failed.
+    INDEXING_STALE_MINUTES: int = 120
 
     # --- RAG / embedding parameters --------------------------------------
     EMBEDDING_DIM: int = 384

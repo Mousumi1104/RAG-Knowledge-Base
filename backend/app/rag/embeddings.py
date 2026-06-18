@@ -206,7 +206,16 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
     Task types: chunk embeddings use ``RETRIEVAL_DOCUMENT`` and query embeddings
     use ``RETRIEVAL_QUERY``, the asymmetric pairing Gemini recommends for
     retrieval. The API embeds one content per request, so a batch is issued as a
-    sequence of single calls (paced by the shared backoff on rate limits).
+    sequence of single calls.
+
+    Rate limiting: the free tier caps embedContent at ~15 RPM, so a large PDF
+    (hundreds of chunks) issued back-to-back 429s the whole job. Every request is
+    therefore paced to a configurable RPM budget (``GEMINI_EMBED_RPM``, default 10
+    — safely under the cap) via a per-INSTANCE monotonic last-call timestamp, so
+    ``embed_texts`` and ``embed_query`` share one global budget. The 429s that
+    still slip through get stronger exponential backoff (``GEMINI_EMBED_MAX_RETRIES``
+    attempts, each sleep clamped to ``GEMINI_EMBED_MAX_BACKOFF_SECONDS``) that
+    honors any server-provided ``Retry-After`` header or ``retryDelay`` body field.
 
     On a persistent 429 the provider raises :class:`RateLimitError` rather than
     silently returning anything — a hash-vector fallback would mix incompatible
@@ -217,26 +226,142 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
     _MODEL = "gemini-embedding-001"
     _BASE = "https://generativelanguage.googleapis.com/v1beta/models"
     _TIMEOUT = 30.0
-    # Short exponential backoff on 429, matching app.rag.llm's tuning.
-    _MAX_RETRIES = 4
-    _BACKOFF_BASE_SECONDS = 0.5
+    # Module-level defensive defaults. The provider reads the matching Settings
+    # values at construction and falls back to these if a setting is absent.
+    _DEFAULT_RPM = 10
+    _DEFAULT_MAX_RETRIES = 6
+    _DEFAULT_BACKOFF_BASE_SECONDS = 0.5
+    _DEFAULT_MAX_BACKOFF_SECONDS = 60.0
 
-    def __init__(self, api_key: str, dim: int | None = None) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        dim: int | None = None,
+        *,
+        rpm: int | None = None,
+        max_retries: int | None = None,
+        backoff_base_seconds: float | None = None,
+        max_backoff_seconds: float | None = None,
+    ) -> None:
         if not api_key:
             raise ValueError("GeminiEmbeddingProvider requires an API key")
         self._api_key = api_key
         self._dim = int(dim if dim is not None else settings.EMBEDDING_DIM)
 
+        # Config-driven knobs with defensive getattr fallbacks so a missing
+        # setting never breaks the provider. Explicit constructor args win.
+        rpm = rpm if rpm is not None else getattr(settings, "GEMINI_EMBED_RPM", self._DEFAULT_RPM)
+        self._rpm = int(rpm) if rpm and int(rpm) > 0 else self._DEFAULT_RPM
+        self._min_interval = 60.0 / self._rpm
+
+        self._max_retries = int(
+            max_retries
+            if max_retries is not None
+            else getattr(settings, "GEMINI_EMBED_MAX_RETRIES", self._DEFAULT_MAX_RETRIES)
+        )
+        self._backoff_base = float(
+            backoff_base_seconds
+            if backoff_base_seconds is not None
+            else getattr(
+                settings, "GEMINI_EMBED_BACKOFF_BASE_SECONDS", self._DEFAULT_BACKOFF_BASE_SECONDS
+            )
+        )
+        self._max_backoff = float(
+            max_backoff_seconds
+            if max_backoff_seconds is not None
+            else getattr(
+                settings, "GEMINI_EMBED_MAX_BACKOFF_SECONDS", self._DEFAULT_MAX_BACKOFF_SECONDS
+            )
+        )
+
+        # Per-INSTANCE monotonic timestamp of the last request. Initialized so the
+        # very first call is not delayed: pretend the previous call happened a full
+        # interval ago.
+        self._last_request_ts: float = time.monotonic() - self._min_interval
+
     @property
     def dim(self) -> int:
         return self._dim
 
+    def _pace(self) -> None:
+        """Enforce the minimum inter-request interval (60/RPM seconds).
+
+        Shared across embed_texts (document loop) and embed_query so every
+        embedContent call draws from one global RPM budget per instance.
+        """
+        now = time.monotonic()
+        wait = self._min_interval - (now - self._last_request_ts)
+        if wait > 0:
+            time.sleep(wait)
+        # Stamp *after* any wait so spacing is measured between actual requests.
+        self._last_request_ts = time.monotonic()
+
+    @staticmethod
+    def _parse_retry_after(response: object) -> float:
+        """Extract a server-suggested retry delay (seconds) from a 429 response.
+
+        Checks the HTTP ``Retry-After`` header (integer seconds) and the JSON
+        error body's ``error.details[].retryDelay`` / top-level ``retryDelay``
+        field (e.g. ``"7s"``). Returns ``0.0`` when nothing usable is present.
+        """
+        best = 0.0
+
+        # HTTP Retry-After header (seconds form; HTTP-date form is ignored).
+        headers = getattr(response, "headers", None)
+        if headers:
+            try:
+                raw = headers.get("Retry-After") or headers.get("retry-after")
+            except AttributeError:
+                raw = None
+            if raw:
+                try:
+                    best = max(best, float(str(raw).strip()))
+                except (TypeError, ValueError):
+                    pass
+
+        # JSON error body retryDelay (Google returns e.g. {"retryDelay": "7s"}).
+        try:
+            body = response.json()  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 - body may be missing/non-JSON
+            body = None
+
+        def _coerce(value: object) -> float:
+            if value is None:
+                return 0.0
+            text = str(value).strip().lower()
+            if text.endswith("ms"):
+                try:
+                    return float(text[:-2]) / 1000.0
+                except ValueError:
+                    return 0.0
+            if text.endswith("s"):
+                text = text[:-1]
+            try:
+                return float(text)
+            except ValueError:
+                return 0.0
+
+        if isinstance(body, dict):
+            error = body.get("error")
+            if isinstance(error, dict):
+                best = max(best, _coerce(error.get("retryDelay")))
+                details = error.get("details")
+                if isinstance(details, list):
+                    for detail in details:
+                        if isinstance(detail, dict):
+                            best = max(best, _coerce(detail.get("retryDelay")))
+            best = max(best, _coerce(body.get("retryDelay")))
+
+        return best
+
     def _embed_one(self, text: str, task_type: str) -> list[float]:
         """Embed a single text with the given Gemini ``task_type``.
 
-        Retries with exponential backoff on 429; raises on persistent rate
-        limiting or any other API/transport error (never returns a fallback
-        vector from an incompatible space).
+        Paces every request to the configured RPM budget, then retries with
+        exponential backoff (clamped to the ceiling) on 429 while honoring any
+        server-provided Retry-After. Raises on persistent rate limiting or any
+        other API/transport error — never returns a fallback vector from an
+        incompatible space.
         """
         import httpx
 
@@ -250,33 +375,51 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
         }
 
         last_exc: Exception | None = None
-        for attempt in range(self._MAX_RETRIES + 1):
+        for attempt in range(self._max_retries + 1):
+            # Pace BEFORE every attempt so the global RPM budget covers retries
+            # too — back-to-back retries would otherwise themselves trip the cap.
+            self._pace()
             try:
                 response = httpx.post(url, headers=headers, json=payload, timeout=self._TIMEOUT)
             except httpx.HTTPError as exc:
                 logger.error("Gemini embeddings request failed: %s", exc)
                 raise ProviderError("Gemini embeddings request failed") from exc
 
-            if response.status_code == 429:
-                last_exc = RateLimitError("Gemini embeddings rate limit exceeded")
-                if attempt < self._MAX_RETRIES:
-                    delay = self._BACKOFF_BASE_SECONDS * (2**attempt)
+            status = response.status_code
+            # 429 (rate limit) AND transient server errors (500/502/503/504) are
+            # retryable with the same paced backoff — Gemini intermittently returns
+            # 503 "overloaded", which must not fail an otherwise-healthy long
+            # indexing run. Non-transient 4xx (400/401/403/404) are NOT retried.
+            if status == 429 or status in (500, 502, 503, 504):
+                last_exc = (
+                    RateLimitError("Gemini embeddings rate limit exceeded")
+                    if status == 429
+                    else ProviderError(f"Gemini embeddings error (status {status})")
+                )
+                if attempt < self._max_retries:
+                    backoff = self._backoff_base * (2**attempt)
+                    retry_after = self._parse_retry_after(response)
+                    delay = min(max(backoff, retry_after), self._max_backoff)
                     logger.warning(
-                        "Gemini embeddings rate limited (attempt %s); retrying in %.1fs",
+                        "Gemini embeddings transient error %s (attempt %s); retrying in %.1fs "
+                        "(backoff=%.1fs retry_after=%.1fs)",
+                        status,
                         attempt + 1,
                         delay,
+                        backoff,
+                        retry_after,
                     )
                     time.sleep(delay)
                     continue
                 raise last_exc
-            if response.status_code >= 400:
+            if status >= 400:
                 logger.error(
                     "Gemini embeddings error %s: %s",
-                    response.status_code,
+                    status,
                     response.text[:500],
                 )
                 raise ProviderError(
-                    f"Gemini embeddings error (status {response.status_code})"
+                    f"Gemini embeddings error (status {status})"
                 )
 
             try:
@@ -362,7 +505,13 @@ def get_embedding_provider() -> EmbeddingProvider:
     if provider == "gemini":
         if settings.GEMINI_API_KEY:
             logger.info("Using Gemini embedding provider (dim=%s)", settings.EMBEDDING_DIM)
-            return GeminiEmbeddingProvider(api_key=settings.GEMINI_API_KEY)
+            return GeminiEmbeddingProvider(
+                api_key=settings.GEMINI_API_KEY,
+                rpm=getattr(settings, "GEMINI_EMBED_RPM", None),
+                max_retries=getattr(settings, "GEMINI_EMBED_MAX_RETRIES", None),
+                backoff_base_seconds=getattr(settings, "GEMINI_EMBED_BACKOFF_BASE_SECONDS", None),
+                max_backoff_seconds=getattr(settings, "GEMINI_EMBED_MAX_BACKOFF_SECONDS", None),
+            )
         logger.warning(
             "EMBEDDING_PROVIDER=gemini but GEMINI_API_KEY is missing; "
             "falling back to the local hashing embedder."

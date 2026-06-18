@@ -24,6 +24,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.database.base import Status
 from app.models.chunk import Chunk
 from app.models.document import Document
@@ -221,7 +222,7 @@ def reindex_document(db: Session, document_id: int) -> Document | None:
     return index_document(db, document_id)
 
 
-def fail_stale_processing(db: Session, older_than_minutes: int = 15) -> int:
+def fail_stale_processing(db: Session, older_than_minutes: int | None = None) -> int:
     """Mark long-stuck ``processing`` documents as ``failed``.
 
     A worker OOM-kill (SIGKILL) can't be caught, so a document indexing at the
@@ -230,8 +231,14 @@ def fail_stale_processing(db: Session, older_than_minutes: int = 15) -> int:
     to ``added_time``) is older than the threshold, marking them ``failed`` with a
     clear error so they can be retried/reindexed.
 
+    The threshold defaults to ``settings.INDEXING_STALE_MINUTES`` (120) — wide
+    enough that a paced Gemini embed job (~24 min for a 240-chunk doc) is never
+    mistaken for a dead one — but callers may override it.
+
     Returns the number of documents updated.
     """
+    if older_than_minutes is None:
+        older_than_minutes = getattr(settings, "INDEXING_STALE_MINUTES", 120)
     cutoff = datetime.now(UTC) - timedelta(minutes=older_than_minutes)
     stmt = select(Document).where(
         Document.status == Status.ACTIVE.value,
