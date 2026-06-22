@@ -8,6 +8,8 @@ Passwords are hashed with bcrypt (see :mod:`app.core.security`).
 
 from __future__ import annotations
 
+import secrets
+
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -26,6 +28,13 @@ class DuplicateEmailError(AppError):
 
     status_code = 409
     detail = "Email already registered"
+
+
+class UserDisabledError(AppError):
+    """The account exists but is disabled / off-boarded (not ACTIVE)."""
+
+    status_code = 403
+    detail = "Account is disabled"
 
 
 def normalize_email(email: str) -> str:
@@ -98,6 +107,68 @@ def create_user(db: Session, email: str, password: str, role: str = "user") -> U
         raise DuplicateEmailError() from exc
     db.refresh(user)
     logger.info("Created user id=%s email=%s role=%s", user.id, normalized, role)
+    return user
+
+
+def provision_employee(
+    db: Session,
+    email: str,
+    employee_id: str | None = None,
+    full_name: str | None = None,
+) -> User:
+    """JIT-provision (or reconcile) an Employee Zone employee, keyed by email.
+
+    Performed once per Employee Zone resolution:
+
+    - Normalize the email (CITEXT, case-insensitive lookup) via
+      :func:`normalize_email` / :func:`get_user_by_email`.
+    - If a (non-deleted) user already exists for that email:
+        - if it is disabled / non-ACTIVE (``status != ACTIVE`` or
+          ``is_active == False``) raise :class:`UserDisabledError` (a 403) to
+          respect off-boarding — never silently re-activate;
+        - otherwise return it unchanged. The role is **never** modified.
+    - Else JIT-create a ``role="user"``, ``is_active=True``, ACTIVE user with a
+      NON-NULL but **unusable** bcrypt password hash (a hash of a random secret),
+      so the email/password login path (:func:`authenticate_user`) can never
+      match an Employee Zone account.
+
+    The role is ALWAYS ``"user"`` — it is never derived from any caller input,
+    so an employee can never be provisioned as ``admin``. ``employee_id`` and
+    ``full_name`` are accepted for the future identity seam but are not persisted
+    yet (no schema column exists).
+    """
+    normalized = normalize_email(email)
+
+    existing = get_user_by_email(db, normalized)
+    if existing is not None:
+        if existing.status != Status.ACTIVE.value or not existing.is_active:
+            raise UserDisabledError()
+        return existing
+
+    user = User(
+        email=normalized,
+        # Non-null, unusable placeholder: a random secret that is never returned,
+        # so the bcrypt verify in authenticate_user can never succeed for it.
+        password_hash=hash_password(secrets.token_urlsafe(32)),
+        role="user",
+        is_active=True,
+        status=Status.ACTIVE.value,
+    )
+    db.add(user)
+    try:
+        db.commit()
+    except IntegrityError:
+        # Lost a race with a concurrent provisioner against the UNIQUE email
+        # index; reload the row the other writer committed.
+        db.rollback()
+        user = get_user_by_email(db, normalized)
+        if user is None:
+            raise
+        if user.status != Status.ACTIVE.value or not user.is_active:
+            raise UserDisabledError() from None
+        return user
+    db.refresh(user)
+    logger.info("Provisioned employee user id=%s email=%s", user.id, normalized)
     return user
 
 

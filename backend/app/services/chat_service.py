@@ -36,6 +36,11 @@ from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+# Sentinel for ``retrieval_owner_id``: distinguishes "caller did not override the
+# retrieval scope" (default to the persistence ``owner_id``) from an explicit
+# ``None`` (the Employee-Zone global-only scope), which is a meaningful value.
+_UNSET: object = object()
+
 # Defensive cap on question length to bound prompt size and abuse.
 _MAX_QUESTION_CHARS = 4000
 
@@ -293,15 +298,24 @@ def _select_context(hits: Sequence[Mapping[str, object]]) -> list[dict]:
     return selected
 
 
-def _build_sources(hits: Sequence[Mapping[str, object]], owner_id: int) -> list[dict]:
-    """Shape search hits into API source dicts: ONLY the user's OWN documents.
+def _build_sources(
+    hits: Sequence[Mapping[str, object]], owner_id: int | None, *, show_global: bool = False
+) -> list[dict]:
+    """Shape search hits into API source dicts (scope-aware display rule).
 
-    Source-reference rule (security-relevant): a hit is shown as a source iff it
-    is one of the requesting user's own documents — ``owner_id == <owner_id> AND
-    is_global == False``. Admin-global docs (``is_global == True``) are allowed to
-    ground the answer (they stay in the prompt context built from ``hits``) but
-    are EXCLUDED from the returned sources. If the answer was grounded only on
-    global docs, this returns an empty list.
+    Source-reference rule (security-relevant):
+
+    - ``show_global == False`` (DEFAULT, the user/admin chat path): a hit is shown
+      as a source iff it is one of the requesting user's own documents
+      (``owner_id == <owner_id> AND is_global == False``). Admin-global docs
+      (``is_global == True``) are allowed to ground the answer (they stay in the
+      prompt context built from ``hits``) but are EXCLUDED from the returned
+      sources. If the answer was grounded only on global docs, this returns an
+      empty list.
+    - ``show_global == True`` (the Employee Zone path, which reads ONLY global
+      docs): admin-global docs ARE included so employees see the company-doc
+      citations. Combined with the global-only retrieval scope, every grounding
+      hit is a global doc, so the employee always gets the citations it deserves.
 
     Retrieval order (most-relevant first) is preserved. Exact ``(document,
     excerpt)`` duplicates are dropped. No numeric score is emitted.
@@ -309,9 +323,14 @@ def _build_sources(hits: Sequence[Mapping[str, object]], owner_id: int) -> list[
     seen: set[tuple[int, str]] = set()
     sources: list[dict] = []
     for hit in hits:
-        # Display only the user's own (non-global) documents.
+        is_global = bool(hit.get("is_global"))
         hit_owner_id = hit.get("owner_id")
-        if hit.get("is_global") or hit_owner_id is None or int(hit_owner_id) != int(owner_id):
+        if is_global:
+            # Global docs are surfaced only when the scope explicitly allows it.
+            if not show_global:
+                continue
+        # Non-global hits are shown only if they belong to the requesting user.
+        elif owner_id is None or hit_owner_id is None or int(hit_owner_id) != int(owner_id):
             continue
         document_id = int(hit.get("document_id", 0) or 0)
         excerpt = str(hit.get("excerpt") or "")
@@ -503,17 +522,31 @@ def _retrieve_and_build_prompt(
     cleaned_question: str,
     top_k: int | None,
     history: Sequence[Mapping[str, str]] | None,
-    owner_id: int,
+    owner_id: int | None,
+    *,
+    include_global: bool = True,
+    show_global: bool = False,
 ) -> tuple[str, str, list[dict]]:
-    """Retrieve tenant-scoped context and build the grounded prompt.
+    """Retrieve scoped context and build the grounded prompt.
 
-    Retrieval is restricted (DEFAULT-DENY) to the user's own docs + admin-global
-    docs. ``relevant`` (the prompt context) may include global docs that ground
-    the answer; ``_build_sources`` then keeps ONLY the user's own docs as visible
-    sources. Returns ``(system, user, sources)``.
+    Retrieval scope is server-derived and DEFAULT-DENY (see
+    :mod:`app.core.access`):
+
+    - The default ``owner_id=<user>, include_global=True`` admits the user's own
+      docs + admin-global docs; ``show_global=False`` then keeps ONLY the user's
+      own docs as visible sources.
+    - The Employee Zone path passes ``owner_id=None, include_global=True`` (the
+      global-only scope) and ``show_global=True`` so company-doc citations are
+      returned.
+
+    Returns ``(system, user, sources)``.
     """
     hits = search_service.search(
-        db, query=cleaned_question, top_k=top_k, owner_id=owner_id, include_global=True
+        db,
+        query=cleaned_question,
+        top_k=top_k,
+        owner_id=owner_id,
+        include_global=include_global,
     )
     # Select context on the blended hybrid ``rank_score``: an absolute relevance
     # gate, then a relative (fraction-of-top) floor so off-topic chunks from
@@ -529,7 +562,7 @@ def _retrieve_and_build_prompt(
         len(relevant),
     )
     system, user = build_rag_prompt(cleaned_question, relevant, history=history)
-    return system, user, _build_sources(relevant, owner_id)
+    return system, user, _build_sources(relevant, owner_id, show_global=show_global)
 
 
 def list_conversations(db: Session, owner_id: int) -> list[Conversation]:
@@ -595,15 +628,22 @@ def stream_answer(
     conversation_id: int | None = None,
     *,
     owner_id: int,
+    retrieval_owner_id: int | None | object = _UNSET,
+    include_global: bool = True,
+    show_global: bool = False,
 ) -> Iterator[tuple[str, object]]:
     """Stream a grounded answer while persisting the conversation turn.
 
     Owns its OWN ``SessionLocal()`` session (the request-scoped ``get_db``
     session is closed before a ``StreamingResponse`` body runs). ``owner_id`` is
     passed as a plain int (NOT an ORM ``User``) across that session boundary; it
-    scopes both retrieval (own + global docs) and the conversation. Resolves/
-    creates the conversation and persists the user message before streaming, then
-    persists the assistant message after streaming.
+    owns the conversation the turn is persisted to. Retrieval scope defaults to
+    ``owner_id`` (own + global docs) but can be overridden via
+    ``retrieval_owner_id`` / ``include_global`` / ``show_global`` (the Employee
+    Zone path passes ``retrieval_owner_id=None`` for global-only retrieval while
+    still owning the conversation as the employee). Resolves/creates the
+    conversation and persists the user message before streaming, then persists the
+    assistant message after streaming.
 
     Yields tuples the API layer turns into SSE frames:
 
@@ -611,6 +651,7 @@ def stream_answer(
     - ``("done", {"sources", "conversation_id", "message_id"})`` once at the end.
     - ``("error", message)`` if anything fails; the generator never raises.
     """
+    scope_owner_id = owner_id if retrieval_owner_id is _UNSET else retrieval_owner_id
     db = SessionLocal()
     try:
         cleaned = _sanitize_question(question)
@@ -662,7 +703,13 @@ def stream_answer(
             effective_history = history
 
         system, user, sources = _retrieve_and_build_prompt(
-            db, cleaned, top_k, effective_history, owner_id
+            db,
+            cleaned,
+            top_k,
+            effective_history,
+            scope_owner_id,
+            include_global=include_global,
+            show_global=show_global,
         )
 
         chunks: list[str] = []
@@ -705,6 +752,9 @@ def query(
     conversation_id: int | None = None,
     *,
     owner_id: int,
+    retrieval_owner_id: int | None | object = _UNSET,
+    include_global: bool = True,
+    show_global: bool = False,
 ) -> dict:
     """Answer ``question`` with RAG over indexed documents and persist the turn.
 
@@ -715,8 +765,15 @@ def query(
         history: Optional prior conversation turns for follow-up support.
         conversation_id: Optional existing conversation to continue; a new one is
             created when omitted/null or not found.
-        owner_id: The requesting user's id. Scopes retrieval (DEFAULT-DENY: own +
-            admin-global docs only) and the conversation it is persisted to.
+        owner_id: The requesting user's id; owns the conversation the turn is
+            persisted to.
+        retrieval_owner_id: Optional override for the retrieval scope owner; when
+            omitted it defaults to ``owner_id`` (DEFAULT-DENY: own + admin-global
+            docs). The Employee Zone path passes ``None`` for global-only
+            retrieval while still owning the conversation as the employee.
+        include_global: Whether admin-global docs may ground the answer.
+        show_global: Whether admin-global docs are surfaced as visible sources
+            (the Employee Zone path sets this True for company-doc citations).
 
     Returns:
         ``{"answer", "sources", "conversation_id", "message_id"}`` where each
@@ -725,6 +782,7 @@ def query(
         is empty and the answer says so. The turn (user + assistant messages) is
         persisted to the resolved conversation.
     """
+    scope_owner_id = owner_id if retrieval_owner_id is _UNSET else retrieval_owner_id
     cleaned = _sanitize_question(question)
     conversation = resolve_or_create_conversation(
         db, conversation_id, cleaned or question, owner_id
@@ -761,7 +819,13 @@ def query(
         effective_history = history
 
     system, user, sources = _retrieve_and_build_prompt(
-        db, cleaned, top_k, effective_history, owner_id
+        db,
+        cleaned,
+        top_k,
+        effective_history,
+        scope_owner_id,
+        include_global=include_global,
+        show_global=show_global,
     )
     answer = _generate_answer(system, user)
 

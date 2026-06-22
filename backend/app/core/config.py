@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: str | None = None
     # Google Gemini (free tier via Google AI Studio: https://aistudio.google.com/apikey).
     GEMINI_API_KEY: str | None = None
+    # Optional second Gemini key used as an automatic fallback when the primary
+    # key hits its free-tier daily quota (HTTP 429 RESOURCE_EXHAUSTED). The
+    # providers rotate to it instantly (no backoff) on a 429 from the primary.
+    GEMINI_API_KEY_FALLBACK: str | None = None
     GEMINI_MODEL: str = "gemini-2.5-flash"
     # --- Gemini embedding rate limiting -----------------------------------
     # The free tier embedContent endpoint embeds one chunk per request and caps
@@ -94,6 +98,32 @@ class Settings(BaseSettings):
     JWT_SECRET_KEY: str = "dev-secret-change-me-in-production"
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 720
+
+    # --- Employee Zone (SSO identity federation) --------------------------
+    # ALL optional with safe defaults so existing boot/tests are unaffected.
+    #
+    # Master switch. When False (the CURRENT mode), the /employee/* endpoints
+    # require NO token at all: identity is resolved from optional unverified
+    # headers, falling back to the shared EZ_DEFAULT_EMPLOYEE_EMAIL. When True
+    # (future), real Employee Zone access-token verification kicks in (see the
+    # TODO seam in app.core.employee_zone).
+    EZ_AUTH_ENABLED: bool = False
+    # --- Reserved for future EZ token verification (not used yet) ---------
+    # Verification mode selector once EZ_AUTH_ENABLED is True
+    # (e.g. "introspection" / "jwks" / "hs256"); "disabled" = no verification.
+    EZ_VERIFY_MODE: str = "disabled"
+    EZ_ISSUER: str | None = None
+    EZ_AUDIENCE: str | None = None
+    EZ_JWKS_URL: str | None = None
+    EZ_SHARED_SECRET: str | None = None
+    EZ_INTROSPECTION_URL: str | None = None
+    # Claim names used to extract identity from a verified EZ token.
+    EZ_EMAIL_CLAIM: str = "email"
+    EZ_EMPLOYEE_ID_CLAIM: str = "emp_id"
+    EZ_NAME_CLAIM: str = "full_name"
+    # The shared identity used when auth is disabled and the client sends no
+    # X-Employee-Email header.
+    EZ_DEFAULT_EMPLOYEE_EMAIL: str = "employee@local"
 
     @property
     def cloudinary_enabled(self) -> bool:
