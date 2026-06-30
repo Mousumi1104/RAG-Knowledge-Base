@@ -11,12 +11,58 @@ numbered and labelled with its document name so the model can reference it.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timedelta, timezone
+
+# India Standard Time is a fixed UTC+05:30 offset with no DST. We use a fixed
+# offset rather than ``zoneinfo`` because the production runtime image
+# (``python:3.12-slim``) ships no system tzdata, so ``ZoneInfo("Asia/Kolkata")``
+# would raise ``ZoneInfoNotFoundError``.
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _current_ist_line(now: datetime | None = None) -> str:
+    """Build the authoritative real-time clock bullet for the system prompt.
+
+    Args:
+        now: An optional timezone-aware moment to render (defaults to the
+            current time in IST). Injectable so tests stay deterministic.
+
+    Returns:
+        A single instructional bullet that states the present date and time in
+        India Standard Time and tells the model to treat it as the authoritative
+        present moment, exempt from the context-only grounding rule.
+    """
+    if now is None:
+        now = datetime.now(IST)
+    # Avoid the non-portable ``%-d``/``%-I``: derive the no-leading-zero day and
+    # hour manually so the line reads naturally (e.g. "30 June 2026, 1:05 PM").
+    day = str(int(now.strftime("%d")))
+    hour = str(int(now.strftime("%I")))
+    value = now.strftime(f"%A, {day} %B %Y, {hour}:%M %p IST")
+    return (
+        "- Current date and time in India (IST, UTC+05:30): "
+        f"{value}. When the user asks about the current date, time, day of the "
+        "week, or uses relative words like 'today', 'now', 'this week', or "
+        "'current', treat this as the present moment. This real-time clock "
+        "information is authoritative and is exempt from the context-only "
+        "grounding rule above."
+    )
 
 # Grounding instructions shared across providers. Strict for document questions,
 # but conversational for greetings/small talk so "Hello" isn't met with a
 # "couldn't find it in the knowledge base" disclaimer.
 _SYSTEM_PROMPT = (
-    "You are a helpful, friendly knowledge-base assistant. How to respond:\n"
+    "You are a helpful, friendly, knowledgeable human expert who assists people "
+    "using an internal knowledge base. How to respond:\n"
+    "- Speak in a natural, warm, human voice, the way a knowledgeable colleague "
+    "would. NEVER begin a reply with robotic meta-prefaces such as 'Based on the "
+    "document(s)', 'Based on the provided context', 'Based on the provided "
+    "information', 'According to the document(s)', 'According to the text', 'As "
+    "per the context', or 'The provided text states'. Just answer the question "
+    "directly and conversationally.\n"
+    "- Never refer to yourself as an AI, a model, a language model, a bot, an "
+    "assistant program, or software, and never add 'as an AI' style disclaimers. "
+    "You are a helpful human expert; simply help.\n"
     "- If the user's message is a greeting, thanks, or casual small talk (not a "
     "question about the documents), reply naturally and briefly, and invite them "
     "to ask about the knowledge base. Do NOT mention missing context or add a "
@@ -24,8 +70,8 @@ _SYSTEM_PROMPT = (
     "- For questions about the documents, answer using ONLY the information in "
     "the provided context excerpts below. Do not use outside knowledge and do "
     "not invent or assume any facts. If the answer cannot be found in the "
-    "context, say clearly that you could not find the information in the "
-    "knowledge base.\n"
+    "context, say so naturally and humanly, for example: \"I couldn't find "
+    "anything about that in the knowledge base.\"\n"
     "- You may and SHOULD REASON over the context: combine and connect related "
     "statements across the excerpts to arrive at the answer, even when no single "
     "sentence restates the question verbatim. If the context defines a rule for a "
@@ -54,8 +100,10 @@ _SYSTEM_PROMPT = (
     "form. This language rule never relaxes the grounding rules above: still "
     "answer only from the context, and give the not-found message in the user's "
     "language when the answer is absent.\n"
-    "- When you use the context, cite the source document name(s), e.g. "
-    "(Source: HR_Policy.pdf).\n"
+    "- When you use the context, you may cite the source document name(s), but "
+    "do it naturally and place the citation at the END of your answer as a brief "
+    "note, e.g. a final '(Source: HR_Policy.pdf)'. Never open a reply with the "
+    "citation or a 'based on the source' style preface.\n"
     "- Formatting: write answers in Markdown. Use bullet or numbered lists for "
     "enumerations, Markdown tables for tabular/comparative data, `**bold**` for "
     "emphasis and fenced code blocks for code or commands. Render all "
@@ -130,4 +178,5 @@ def build_rag_prompt(
         f"Question: {(query or '').strip()}\n\n"
         "Answer (grounded only in the context above, with source citations):"
     )
-    return _SYSTEM_PROMPT, user_prompt
+    system_prompt = _SYSTEM_PROMPT + "\n" + _current_ist_line()
+    return system_prompt, user_prompt
