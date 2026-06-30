@@ -103,6 +103,138 @@ def _extract_pdf_pages(file_path: str) -> list[str]:
     return pages
 
 
+def _linearize_table(table: list[list[str | None]]) -> list[str]:
+    """Turn one extracted table grid into self-contained, atomic text lines.
+
+    A 2-D table (e.g. a schedule matrix of dates x workstations) loses all
+    meaning when flattened to layout text: column headers end up far from the
+    cells they label, so a value can no longer be tied to its column. We restore
+    that association by emitting, for a grid that has group/banner labels, ONE
+    short line per data cell that repeats the row's key columns, e.g.::
+
+        1-Jul-26 (Wed, Working Day) - WS#9 (Room 11): Mousumi Sengupta
+
+    Per-cell (not per-row) lines are deliberate: the chunker hard-slices any unit
+    longer than the chunk size, so a long per-row line would be cut mid-row and
+    re-detach a seat from its date. Each atomic line stays well under the chunk
+    size and carries date+seat+room+name together, so retrieval is reliable.
+    Tables without banner/group rows fall back to one "Header: value | ..." line
+    per row (typically short).
+
+    Returns a list of lines; the caller joins them with blank lines so the
+    chunker treats each as its own semantic unit and never splits one.
+    """
+    rows = [
+        [(c or "").strip() for c in row]
+        for row in table
+        if any((c or "").strip() for c in row)
+    ]
+    if len(rows) < 2:
+        return []
+    ncols = max(len(r) for r in rows)
+    rows = [r + [""] * (ncols - len(r)) for r in rows]
+
+    # Header = the row with the most non-empty cells (earliest wins on a tie).
+    counts = [sum(1 for c in r if c) for r in rows]
+    h = max(range(len(rows)), key=lambda i: counts[i])
+    header = rows[h]
+
+    # Banner rows above the header become forward-filled per-column group labels
+    # (so "Room 16"/"Room 11" attach to the right workstation columns); a banner
+    # row with a single value is treated as a table caption instead.
+    group = [""] * ncols
+    captions: list[str] = []
+    for r in rows[:h]:
+        non_empty = [c for c in r if c]
+        if len(non_empty) == 1:
+            captions.append(non_empty[0])
+            continue
+        if len(non_empty) >= 2:
+            last = ""
+            for i in range(ncols):
+                if r[i]:
+                    last = r[i]
+                if last:
+                    group[i] = (group[i] + " " + last).strip()
+
+    def label_for(i: int) -> str:
+        return header[i] if i < len(header) and header[i] else f"Col{i + 1}"
+
+    # Key columns = the leading run that shares column 0's group label; the first
+    # column whose group differs marks the start of the value columns. When there
+    # are no group labels at all, every column is "key" and we fall back to a
+    # compact per-row line.
+    key_end = ncols
+    for i in range(ncols):
+        if group[i] != group[0]:
+            key_end = i
+            break
+
+    lines: list[str] = []
+    for r in rows[h + 1:]:
+        if not any(r):
+            continue
+        key_vals = [r[i] for i in range(key_end) if r[i]]
+        if key_vals:
+            prefix = key_vals[0]
+            if len(key_vals) > 1:
+                prefix += " (" + ", ".join(key_vals[1:]) + ")"
+        else:
+            prefix = ""
+
+        value_cols = [i for i in range(key_end, ncols) if r[i]]
+        if value_cols and prefix:
+            for i in value_cols:
+                grp = f" ({group[i]})" if group[i] else ""
+                lines.append(f"{prefix} - {label_for(i)}{grp}: {r[i]}")
+        else:
+            # No clean key/value split (e.g. a plain table) -> compact per-row line.
+            parts = [
+                f"{label_for(i)}: {r[i]}" for i in range(ncols) if r[i]
+            ]
+            if parts:
+                lines.append(" | ".join(parts))
+
+    if captions and lines:
+        lines.insert(0, "Table: " + "; ".join(captions))
+    return lines
+
+
+def _extract_pdf_tables_text(file_path: str) -> dict[int, str]:
+    """Return a page_number -> structured-table-text map for a PDF.
+
+    Best-effort and additive: any failure (or a PDF with no detectable tables)
+    yields no structured text for that page and the caller keeps the normal
+    layout extraction. Never raises — indexing must not break on a tricky PDF.
+    """
+    try:
+        import pdfplumber
+    except Exception as exc:  # noqa: BLE001 - dependency missing/broken; skip tables
+        logger.warning("pdfplumber unavailable, skipping table extraction: %s", exc)
+        return {}
+
+    structured: dict[int, str] = {}
+    try:
+        with pdfplumber.open(file_path) as pdf:
+            for page_number, page in enumerate(pdf.pages, start=1):
+                try:
+                    tables = page.extract_tables() or []
+                except Exception as exc:  # noqa: BLE001 - skip this page's tables
+                    logger.warning("Table extraction failed on page %d: %s", page_number, exc)
+                    continue
+                page_lines: list[str] = []
+                for table in tables:
+                    page_lines.extend(_linearize_table(table))
+                if page_lines:
+                    # Blank-line separated so the chunker treats each atomic line
+                    # as its own semantic unit and never slices one mid-line.
+                    structured[page_number] = "\n\n".join(page_lines)
+    except Exception as exc:  # noqa: BLE001 - whole-file fallback, keep layout text
+        logger.warning("pdfplumber could not open %s for tables: %s", file_path, exc)
+        return {}
+    return structured
+
+
 def _extract_docx(file_path: str) -> str:
     import docx
 
@@ -142,10 +274,24 @@ def extract_pages(file_path: str, document_type: str) -> list[tuple[int, str]]:
     # Resolve remote (Cloudinary) URLs to a temp file; local paths pass through.
     with _local_path(file_path, doc_type) as local:
         if doc_type == "pdf":
-            return [
-                (page_number, clean_text(raw))
-                for page_number, raw in enumerate(_extract_pdf_pages(local), start=1)
-            ]
+            # Table-aware extraction (additive): append per-row structured text so
+            # each cell stays tied to its column header (e.g. a workstation number
+            # to the person sitting at it). Falls back silently to layout-only text
+            # for non-table PDFs or if pdfplumber fails.
+            tables_by_page = _extract_pdf_tables_text(local)
+            pages: list[tuple[int, str]] = []
+            for page_number, raw in enumerate(_extract_pdf_pages(local), start=1):
+                text = clean_text(raw)
+                structured = tables_by_page.get(page_number)
+                if structured:
+                    structured = clean_text(structured)
+                    text = (
+                        f"{text}\n\nStructured table data:\n{structured}"
+                        if text
+                        else f"Structured table data:\n{structured}"
+                    )
+                pages.append((page_number, text))
+            return pages
         if doc_type == "docx":
             return [(1, clean_text(_extract_docx(local)))]
         # txt / md

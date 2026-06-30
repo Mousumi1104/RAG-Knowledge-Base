@@ -17,3 +17,5 @@ cloudinary
 numpy
 pytest
 pytest-asyncio
+
+pdfplumber
