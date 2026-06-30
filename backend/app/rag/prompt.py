@@ -48,6 +48,28 @@ def _current_ist_line(now: datetime | None = None) -> str:
         "grounding rule above."
     )
 
+
+def _current_employee_line(name: str | None, emp_id: str | None) -> str:
+    """Build the authoritative "Current employee" system-prompt bullet.
+
+    Returns "" when neither name nor id is supplied (e.g. the regular user/admin
+    chat path), so the system prompt is byte-identical to before in that case.
+    Mirrors :func:`_current_ist_line`: the identity is stated as ground truth and
+    exempt from the context-only grounding rule. See EZ chat auth spec §3.
+    """
+    name = (name or "").strip()
+    emp_id = (emp_id or "").strip()
+    if not name and not emp_id:
+        return ""
+    who = name or "the employee"
+    id_part = f" (employee ID {emp_id})" if emp_id else ""
+    return (
+        f"\n- Current employee: you are assisting {who}{id_part}. When they say "
+        "'I', 'me' or 'my', this is who they mean; address them by name when it "
+        "reads naturally. This identity is authoritative and exempt from the "
+        "context-only grounding rule above."
+    )
+
 # Grounding instructions shared across providers. Strict for document questions,
 # but conversational for greetings/small talk so "Hello" isn't met with a
 # "couldn't find it in the knowledge base" disclaimer.
@@ -155,6 +177,8 @@ def build_rag_prompt(
     query: str,
     contexts: Sequence[Mapping[str, object]],
     history: Sequence[Mapping[str, str]] | None = None,
+    employee_name: str | None = None,
+    employee_id: str | None = None,
 ) -> tuple[str, str]:
     """Build the ``(system, user)`` prompt pair for a RAG generation call.
 
@@ -178,5 +202,10 @@ def build_rag_prompt(
         f"Question: {(query or '').strip()}\n\n"
         "Answer (grounded only in the context above, with source citations):"
     )
-    system_prompt = _SYSTEM_PROMPT + "\n" + _current_ist_line()
+    system_prompt = (
+        _SYSTEM_PROMPT
+        + "\n"
+        + _current_ist_line()
+        + _current_employee_line(employee_name, employee_id)
+    )
     return system_prompt, user_prompt

@@ -526,6 +526,8 @@ def _retrieve_and_build_prompt(
     *,
     include_global: bool = True,
     show_global: bool = False,
+    employee_name: str | None = None,
+    employee_id: str | None = None,
 ) -> tuple[str, str, list[dict]]:
     """Retrieve scoped context and build the grounded prompt.
 
@@ -561,7 +563,13 @@ def _retrieve_and_build_prompt(
         len(hits),
         len(relevant),
     )
-    system, user = build_rag_prompt(cleaned_question, relevant, history=history)
+    system, user = build_rag_prompt(
+        cleaned_question,
+        relevant,
+        history=history,
+        employee_name=employee_name,
+        employee_id=employee_id,
+    )
     return system, user, _build_sources(relevant, owner_id, show_global=show_global)
 
 
@@ -631,6 +639,8 @@ def stream_answer(
     retrieval_owner_id: int | None | object = _UNSET,
     include_global: bool = True,
     show_global: bool = False,
+    employee_name: str | None = None,
+    employee_id: str | None = None,
 ) -> Iterator[tuple[str, object]]:
     """Stream a grounded answer while persisting the conversation turn.
 
@@ -710,6 +720,8 @@ def stream_answer(
             scope_owner_id,
             include_global=include_global,
             show_global=show_global,
+            employee_name=employee_name,
+            employee_id=employee_id,
         )
 
         chunks: list[str] = []
@@ -755,6 +767,8 @@ def query(
     retrieval_owner_id: int | None | object = _UNSET,
     include_global: bool = True,
     show_global: bool = False,
+    employee_name: str | None = None,
+    employee_id: str | None = None,
 ) -> dict:
     """Answer ``question`` with RAG over indexed documents and persist the turn.
 

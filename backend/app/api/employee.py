@@ -39,6 +39,7 @@ from app.core import access
 from app.core.employee_zone import (
     _HEADER_EMPLOYEE_ID,
     _HEADER_EMPLOYEE_NAME,
+    require_api_key,
     resolve_employee,
 )
 from app.database.session import get_db
@@ -57,7 +58,13 @@ from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-router = APIRouter(prefix="/employee", tags=["employee"])
+router = APIRouter(
+    prefix="/employee",
+    tags=["employee"],
+    # Shared API-key gate on every /employee/* route. Fail-open while
+    # EZ_CHAT_API_KEY is unset (rollout window); see EZ chat auth spec §2.
+    dependencies=[Depends(require_api_key)],
+)
 
 # Headers that keep SSE frames flowing through dev servers and proxies (identical
 # to the /chat router so frames stay byte-compatible).
@@ -84,6 +91,7 @@ def get_current_employee(
 @router.post("/chat/query", response_model=ChatResponse)
 def employee_chat_query(
     payload: ChatRequest,
+    request: Request,
     db: Session = Depends(get_db),
     employee: User = Depends(get_current_employee),
 ) -> ChatResponse:
@@ -95,6 +103,9 @@ def employee_chat_query(
     """
     history = [message.model_dump() for message in payload.history] if payload.history else None
     owner_id, include_global = access.GLOBAL_ONLY
+    # Thread the (unverified, Mode A) employee identity into the prompt (spec §3).
+    employee_name = request.headers.get(_HEADER_EMPLOYEE_NAME)
+    employee_id = request.headers.get(_HEADER_EMPLOYEE_ID)
     logger.info(
         "POST /employee/chat/query query=%r top_k=%s conversation_id=%s employee_id=%s",
         payload.query,
@@ -113,6 +124,8 @@ def employee_chat_query(
         retrieval_owner_id=owner_id,
         include_global=include_global,
         show_global=True,
+        employee_name=employee_name,
+        employee_id=employee_id,
     )
 
     sources = [Source(**source) for source in result.get("sources", [])]
@@ -127,6 +140,7 @@ def employee_chat_query(
 @router.post("/chat/stream")
 def employee_chat_stream(
     payload: ChatRequest,
+    request: Request,
     employee: User = Depends(get_current_employee),
 ) -> StreamingResponse:
     """Stream a grounded answer (global-only scope) as Server-Sent Events.
@@ -136,9 +150,12 @@ def employee_chat_stream(
     owned by the resolved employee.
     """
     history = [message.model_dump() for message in payload.history] if payload.history else None
-    # Capture ids as plain ints: the SSE generator runs AFTER the request-scoped
-    # DB session closes, so the ORM ``User`` must not cross into it.
+    # Capture ids as plain ints/strings: the SSE generator runs AFTER the
+    # request-scoped DB session closes, so the ORM ``User`` and the request must
+    # not cross into it.
     owner_id = employee.id
+    employee_name = request.headers.get(_HEADER_EMPLOYEE_NAME)
+    employee_id = request.headers.get(_HEADER_EMPLOYEE_ID)
     scope_owner_id, include_global = access.GLOBAL_ONLY
     logger.info(
         "POST /employee/chat/stream query=%r top_k=%s conversation_id=%s employee_id=%s",
@@ -158,6 +175,8 @@ def employee_chat_stream(
             retrieval_owner_id=scope_owner_id,
             include_global=include_global,
             show_global=True,
+            employee_name=employee_name,
+            employee_id=employee_id,
         ):
             if kind == "delta":
                 yield f"data: {json.dumps({'delta': value})}\n\n"

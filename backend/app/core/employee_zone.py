@@ -28,7 +28,9 @@ a resolved :class:`~app.models.user.User`. It has two modes, selected by
 
 from __future__ import annotations
 
-from fastapi import HTTPException, Request, status
+import secrets
+
+from fastapi import Header, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -39,6 +41,28 @@ from app.services import user_service
 _HEADER_EMPLOYEE_ID = "X-Employee-Id"
 _HEADER_EMPLOYEE_EMAIL = "X-Employee-Email"
 _HEADER_EMPLOYEE_NAME = "X-Employee-Name"
+_HEADER_API_KEY = "X-API-Key"
+
+
+def require_api_key(
+    x_api_key: str | None = Header(default=None, alias=_HEADER_API_KEY),
+) -> None:
+    """Gate /employee/* with the shared EZ chat API key (constant-time compare).
+
+    When ``EZ_CHAT_API_KEY`` is unset the gate is a no-op (rollout window); once
+    set in Render every /employee/* request must present a matching ``X-API-Key``.
+    The key is embedded in the mobile client and therefore extractable — this is a
+    low-assurance gate against casual/anonymous abuse, not authenticated identity
+    (see EZ chat auth spec §2/§4).
+    """
+    expected = get_settings().EZ_CHAT_API_KEY
+    if not expected:
+        return  # not configured yet -> fail open (rollout window)
+    if not x_api_key or not secrets.compare_digest(x_api_key, expected):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing API key",
+        )
 
 
 def resolve_employee(db: Session, request: Request) -> User:

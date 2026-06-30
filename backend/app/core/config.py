@@ -124,6 +124,9 @@ class Settings(BaseSettings):
     # The shared identity used when auth is disabled and the client sends no
     # X-Employee-Email header.
     EZ_DEFAULT_EMPLOYEE_EMAIL: str = "employee@local"
+    # Shared API key gating /employee/* (Mode A). When unset, the gate is a no-op
+    # (rollout window); set it in Render to enforce. See EZ chat auth spec §2.
+    EZ_CHAT_API_KEY: str | None = None
 
     @property
     def cloudinary_enabled(self) -> bool:
