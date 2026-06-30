@@ -171,6 +171,8 @@ def _linearize_table(table: list[list[str | None]]) -> list[str]:
             break
 
     lines: list[str] = []
+    # value -> ordered-unique row keys it appears against (for aggregate summaries)
+    occurrences: dict[str, list[str]] = {}
     for r in rows[h + 1:]:
         if not any(r):
             continue
@@ -184,9 +186,13 @@ def _linearize_table(table: list[list[str | None]]) -> list[str]:
 
         value_cols = [i for i in range(key_end, ncols) if r[i]]
         if value_cols and prefix:
+            row_key = key_vals[0]
             for i in value_cols:
                 grp = f" ({group[i]})" if group[i] else ""
                 lines.append(f"{prefix} - {label_for(i)}{grp}: {r[i]}")
+                seen = occurrences.setdefault(r[i], [])
+                if row_key not in seen:
+                    seen.append(row_key)
         else:
             # No clean key/value split (e.g. a plain table) -> compact per-row line.
             parts = [
@@ -194,6 +200,37 @@ def _linearize_table(table: list[list[str | None]]) -> list[str]:
             ]
             if parts:
                 lines.append(" | ".join(parts))
+
+    # Aggregate summary lines: a value that appears against many row keys is
+    # spread across many chunks, so top-k retrieval can never gather them all to
+    # answer a "how many ..." count. Emit one self-contained summary per such
+    # value (count + the full row-key list) so a single chunk answers it.
+    if occurrences:
+        key_label = (header[0] if header and header[0] else "").lower()
+        sample_key = next(iter(occurrences.values()))[0] if occurrences else ""
+        date_like = bool(re.match(r"\d+[-/][A-Za-z0-9]+[-/]\d", sample_key))
+        if "date" in key_label or "day" in key_label or date_like:
+            unit = "days"
+        elif key_label:
+            unit = key_label if key_label.endswith("s") else key_label + "s"
+        else:
+            unit = "entries"
+        caption = "; ".join(captions)
+
+        def _key_sort(k: str) -> tuple[int, str]:
+            m = re.match(r"\s*(\d+)", k)
+            return (int(m.group(1)) if m else 1_000_000, k)
+
+        summary_lines: list[str] = []
+        for value, keys in occurrences.items():
+            if len(keys) < 2:
+                continue
+            ordered = sorted(keys, key=_key_sort)
+            line = f"{value} - total {len(ordered)} {unit}: {', '.join(ordered)}"
+            if caption:
+                line += f" ({caption})"
+            summary_lines.append(line)
+        lines.extend(summary_lines)
 
     if captions and lines:
         lines.insert(0, "Table: " + "; ".join(captions))
