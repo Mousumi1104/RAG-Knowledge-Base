@@ -244,6 +244,81 @@ def test_retry_after_from_json_body_retrydelay(monkeypatch):
     assert any(s >= 30.0 for s in sleeps), f"expected a >=30s backoff sleep, got {sleeps}"
 
 
+def test_rotate_on_429_uses_fallback_key_without_delay(monkeypatch):
+    """A 429 on the PRIMARY key rotates to the FALLBACK key instantly (no backoff)."""
+    sleeps, _ = _patch_clock(monkeypatch)
+    provider = _make_provider(api_key=None, api_keys=["primary", "fallback"])
+
+    used_keys: list[str] = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        key = (headers or {}).get("x-goog-api-key")
+        used_keys.append(key)
+        if key == "primary":
+            return _FakeResponse(429, {}, text="rate limited")
+        return _FakeResponse(200, _ok_body(provider.dim))
+
+    import httpx as _httpx
+
+    monkeypatch.setattr(_httpx, "post", fake_post)
+
+    vec = provider.embed_query("hello")
+
+    assert len(vec) == provider.dim
+    # Primary tried first (429), then fallback (200) — both on the FIRST pass.
+    assert used_keys == ["primary", "fallback"]
+    # The instant 429->rotate must NOT incur any exponential BACKOFF sleep. The
+    # only sleep that may occur is the per-call RPM pacing (== the 6.0s min
+    # interval, applied once before the fallback's HTTP call). A backoff would be
+    # the 0.5 * 2**0 = 0.5s base (or a Retry-After), which must be absent here.
+    backoff_sleeps = [s for s in sleeps if 0 < s < 6.0]
+    assert not backoff_sleeps, f"rotation should not back off, got {sleeps}"
+
+
+def test_all_keys_exhausted_raises_ratelimit(monkeypatch):
+    """When EVERY key returns 429, RateLimitError is raised (no fallback vector)."""
+    _patch_clock(monkeypatch)
+    provider = _make_provider(api_key=None, api_keys=["primary", "fallback"], max_retries=2)
+
+    used_keys: list[str] = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        used_keys.append((headers or {}).get("x-goog-api-key"))
+        return _FakeResponse(429, {}, text="rate limited")
+
+    import httpx as _httpx
+
+    monkeypatch.setattr(_httpx, "post", fake_post)
+
+    with pytest.raises(RateLimitError):
+        provider.embed_query("hello")
+
+    # 2 keys * (max_retries=2 → 3 passes) = 6 POSTs, all 429.
+    assert len(used_keys) == 6
+    assert set(used_keys) == {"primary", "fallback"}
+
+
+def test_back_compat_single_key_construction(monkeypatch):
+    """Single-key construction (api_key="k", no api_keys) still embeds on 200."""
+    _patch_clock(monkeypatch)
+    provider = _make_provider(api_key="solo-key")
+
+    used_keys: list[str] = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        used_keys.append((headers or {}).get("x-goog-api-key"))
+        return _FakeResponse(200, _ok_body(provider.dim))
+
+    import httpx as _httpx
+
+    monkeypatch.setattr(_httpx, "post", fake_post)
+
+    vec = provider.embed_query("hello")
+
+    assert len(vec) == provider.dim
+    assert used_keys == ["solo-key"]
+
+
 def test_first_call_not_delayed(monkeypatch):
     """The very first embed request incurs no pacing sleep."""
     sleeps, _ = _patch_clock(monkeypatch)

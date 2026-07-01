@@ -467,6 +467,12 @@ class GeminiLLMProvider(LLMProvider):
     Targets the free-tier models served at ``generativelanguage.googleapis.com``
     (e.g. ``gemini-2.0-flash``). The API key is sent in the ``x-goog-api-key``
     header rather than the URL query string to keep it out of logs.
+
+    Key rotation: the provider holds an ordered list of API keys (primary first,
+    then fallbacks). On a 429 (free-tier daily quota exhausted) it rotates to the
+    next key and retries the SAME request immediately. Only when ALL keys have
+    been exhausted does the caller fall through to the documented local-provider
+    fallback. Transient/backoff behavior otherwise matches the other providers.
     """
 
     _MODEL = "gemini-2.5-flash"
@@ -474,18 +480,105 @@ class GeminiLLMProvider(LLMProvider):
     _TIMEOUT = 60.0
     _MAX_TOKENS = 1024
 
-    def __init__(self, api_key: str, model: str | None = None) -> None:
-        if not api_key:
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str | None = None,
+        *,
+        api_keys: list[str] | None = None,
+    ) -> None:
+        # Accept BOTH a single ``api_key`` (back-compat) or an ordered
+        # ``api_keys`` list (primary first, then fallbacks). De-duplicate while
+        # preserving order and dropping falsy entries.
+        raw_keys: list[str] = []
+        if api_keys:
+            raw_keys.extend(api_keys)
+        if api_key:
+            raw_keys.append(api_key)
+        seen: set[str] = set()
+        self._keys: list[str] = []
+        for key in raw_keys:
+            if key and key not in seen:
+                seen.add(key)
+                self._keys.append(key)
+        if not self._keys:
             raise ValueError("GeminiLLMProvider requires an API key")
-        self._api_key = api_key
+        # Keep ``self._api_key`` working for any code that reads it: the primary.
+        self._api_key = self._keys[0]
         self._model = model or self._MODEL
 
     def _url(self, method: str, *, sse: bool = False) -> str:
         suffix = "?alt=sse" if sse else ""
         return f"{self._BASE}/{self._model}:{method}{suffix}"
 
-    def _headers(self) -> dict[str, str]:
-        return {"Content-Type": "application/json", "x-goog-api-key": self._api_key}
+    def _headers(self, api_key: str | None = None) -> dict[str, str]:
+        return {
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key or self._api_key,
+        }
+
+    def _post_rotating(self, url: str, payload: dict[str, object]):
+        """POST with key rotation on 429 + shared backoff, returning the response.
+
+        Each backoff pass walks the ordered key ring: a 429 rotates to the next
+        key immediately (no delay). Only when EVERY key returns 429 on a pass does
+        the paced exponential backoff apply before retrying the whole ring. Other
+        4xx/5xx and transport errors are mapped to exceptions exactly like
+        :func:`_post_with_retry`.
+        """
+        import httpx
+
+        last_exc: Exception | None = None
+        for attempt in range(_MAX_RETRIES + 1):
+            all_429 = True
+            for key in self._keys:
+                try:
+                    response = httpx.post(
+                        url,
+                        headers=self._headers(key),
+                        json=payload,
+                        timeout=self._TIMEOUT,
+                    )
+                except httpx.HTTPError as exc:
+                    logger.error("Gemini request failed: %s", exc)
+                    raise ProviderError("Gemini request failed") from exc
+
+                if response.status_code == 429:
+                    last_exc = RateLimitError("Gemini rate limit exceeded")
+                    logger.warning(
+                        "Gemini rate limited on key #%s; rotating to next key.",
+                        self._keys.index(key) + 1,
+                    )
+                    continue
+
+                if response.status_code >= 400:
+                    logger.error(
+                        "Gemini error %s: %s",
+                        response.status_code,
+                        response.text[:500],
+                    )
+                    raise ProviderError(
+                        f"Gemini error (status {response.status_code})"
+                    )
+
+                all_429 = False
+                return response
+
+            # Reached only if every key returned 429 this pass.
+            if all_429 and attempt < _MAX_RETRIES:
+                delay = _BACKOFF_BASE_SECONDS * (2**attempt)
+                logger.warning(
+                    "Gemini: all %s key(s) rate limited (pass %s); retrying in %.1fs",
+                    len(self._keys),
+                    attempt + 1,
+                    delay,
+                )
+                time.sleep(delay)
+                continue
+            raise last_exc or RateLimitError("Gemini rate limit exceeded")
+
+        # Defensive: only reached if the loop exits without returning/raising.
+        raise last_exc or ProviderError("Gemini request failed")
 
     def _payload(self, prompt: str, system: str | None) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -504,12 +597,9 @@ class GeminiLLMProvider(LLMProvider):
         return payload
 
     def generate(self, prompt: str, system: str | None = None) -> str:
-        response = _post_with_retry(
+        response = self._post_rotating(
             self._url("generateContent"),
-            self._headers(),
             self._payload(prompt, system),
-            self._TIMEOUT,
-            "Gemini",
         )
         try:
             data = response.json()
@@ -528,30 +618,50 @@ class GeminiLLMProvider(LLMProvider):
         """
         import httpx
 
+        url = self._url("streamGenerateContent", sse=True)
+        payload = self._payload(prompt, system)
+
         yielded_any = False
-        try:
-            with httpx.Client(timeout=self._TIMEOUT) as client:
-                with client.stream(
-                    "POST",
-                    self._url("streamGenerateContent", sse=True),
-                    headers=self._headers(),
-                    json=self._payload(prompt, system),
-                ) as response:
-                    if response.status_code >= 400:
-                        response.read()
-                        raise ProviderError(f"Gemini error (status {response.status_code})")
-                    for line in response.iter_lines():
-                        text = _parse_gemini_sse_line(line)
-                        if text:
-                            yielded_any = True
-                            yield text
-            if yielded_any:
-                return
-        except Exception as exc:  # noqa: BLE001 - generator must never raise.
-            logger.warning(
-                "Gemini streaming failed (%s); falling back to non-streamed answer.",
-                exc,
-            )
+        # Rotate keys on a streaming 429 (quota exhausted): try each key in order,
+        # advancing to the next on a 429 before the request starts yielding. Any
+        # other error breaks out to the non-streamed fallback below.
+        for key in self._keys:
+            try:
+                with httpx.Client(timeout=self._TIMEOUT) as client:
+                    with client.stream(
+                        "POST",
+                        url,
+                        headers=self._headers(key),
+                        json=payload,
+                    ) as response:
+                        if response.status_code == 429:
+                            response.read()
+                            logger.warning(
+                                "Gemini streaming rate limited on key #%s; "
+                                "rotating to next key.",
+                                self._keys.index(key) + 1,
+                            )
+                            continue
+                        if response.status_code >= 400:
+                            response.read()
+                            raise ProviderError(
+                                f"Gemini error (status {response.status_code})"
+                            )
+                        for line in response.iter_lines():
+                            text = _parse_gemini_sse_line(line)
+                            if text:
+                                yielded_any = True
+                                yield text
+                if yielded_any:
+                    return
+                # A clean 200 with no text — stop rotating and fall back.
+                break
+            except Exception as exc:  # noqa: BLE001 - generator must never raise.
+                logger.warning(
+                    "Gemini streaming failed (%s); falling back to non-streamed answer.",
+                    exc,
+                )
+                break
 
         if not yielded_any:
             try:
@@ -721,10 +831,17 @@ def get_llm_provider() -> LLMProvider:
 
     if provider == "gemini":
         if settings.GEMINI_API_KEY:
-            logger.info("Using Gemini LLM provider (model=%s)", settings.GEMINI_MODEL)
-            return GeminiLLMProvider(
-                api_key=settings.GEMINI_API_KEY, model=settings.GEMINI_MODEL
+            keys = [
+                k
+                for k in (settings.GEMINI_API_KEY, settings.GEMINI_API_KEY_FALLBACK)
+                if k
+            ]
+            logger.info(
+                "Using Gemini LLM provider (model=%s, keys=%s)",
+                settings.GEMINI_MODEL,
+                len(keys),
             )
+            return GeminiLLMProvider(api_keys=keys, model=settings.GEMINI_MODEL)
         logger.warning(
             "LLM_PROVIDER=gemini but GEMINI_API_KEY is missing; "
             "falling back to the local extractive provider."

@@ -221,6 +221,14 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
     silently returning anything — a hash-vector fallback would mix incompatible
     embedding spaces and quietly destroy retrieval, so the caller must see the
     error instead.
+
+    Key rotation: the provider holds an ORDERED list of API keys (primary first,
+    then any fallbacks). When a key returns 429 (free-tier daily quota exhausted)
+    it rotates to the next key and retries the SAME request IMMEDIATELY with NO
+    delay — a daily-exhausted primary should fall through to a healthy fallback
+    instantly. The paced exponential backoff only kicks in once EVERY key has
+    returned 429 on a full pass. Transient 5xx errors stay on the same key
+    (backoff + retry) since they are not a quota issue.
     """
 
     _MODEL = "gemini-embedding-001"
@@ -235,17 +243,34 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
 
     def __init__(
         self,
-        api_key: str,
+        api_key: str | None = None,
         dim: int | None = None,
         *,
+        api_keys: list[str] | None = None,
         rpm: int | None = None,
         max_retries: int | None = None,
         backoff_base_seconds: float | None = None,
         max_backoff_seconds: float | None = None,
     ) -> None:
-        if not api_key:
+        # Accept BOTH forms: a single ``api_key`` (back-compat) or an ordered
+        # ``api_keys`` list (primary first, then fallbacks). Build a de-duplicated
+        # list preserving order and dropping falsy entries.
+        raw_keys: list[str] = []
+        if api_keys:
+            raw_keys.extend(api_keys)
+        if api_key:
+            raw_keys.append(api_key)
+        seen: set[str] = set()
+        self._keys: list[str] = []
+        for key in raw_keys:
+            if key and key not in seen:
+                seen.add(key)
+                self._keys.append(key)
+        if not self._keys:
             raise ValueError("GeminiEmbeddingProvider requires an API key")
-        self._api_key = api_key
+        # Keep ``self._api_key`` working for any other code that reads it: the
+        # primary (first) key.
+        self._api_key = self._keys[0]
         self._dim = int(dim if dim is not None else settings.EMBEDDING_DIM)
 
         # Config-driven knobs with defensive getattr fallbacks so a missing
@@ -357,16 +382,20 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
     def _embed_one(self, text: str, task_type: str) -> list[float]:
         """Embed a single text with the given Gemini ``task_type``.
 
-        Paces every request to the configured RPM budget, then retries with
-        exponential backoff (clamped to the ceiling) on 429 while honoring any
-        server-provided Retry-After. Raises on persistent rate limiting or any
-        other API/transport error — never returns a fallback vector from an
-        incompatible space.
+        Rotates an ordered ring of API keys on 429: each backoff "pass" tries
+        every key in order, sending the request with that key's
+        ``x-goog-api-key`` header. A 429 advances to the NEXT key and retries the
+        SAME request immediately (no delay) so a daily-exhausted primary falls
+        through to a healthy fallback instantly. Only when ALL keys return 429 on
+        a full pass does the paced exponential backoff (Retry-After-aware) apply
+        before the next pass, up to ``max_retries`` passes. Transient 5xx errors
+        stay on the SAME key (backoff + retry) since they are not quota-related.
+        Raises on persistent rate limiting or any other API/transport error —
+        never returns a fallback vector from an incompatible space.
         """
         import httpx
 
         url = f"{self._BASE}/{self._MODEL}:embedContent"
-        headers = {"Content-Type": "application/json", "x-goog-api-key": self._api_key}
         payload = {
             "model": f"models/{self._MODEL}",
             "content": {"parts": [{"text": text or ""}]},
@@ -375,35 +404,83 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
         }
 
         last_exc: Exception | None = None
+        # Each "pass" walks the whole key ring. A pass that ends with every key
+        # 429'd applies the paced backoff before the next pass.
         for attempt in range(self._max_retries + 1):
-            # Pace BEFORE every attempt so the global RPM budget covers retries
-            # too — back-to-back retries would otherwise themselves trip the cap.
-            self._pace()
-            try:
-                response = httpx.post(url, headers=headers, json=payload, timeout=self._TIMEOUT)
-            except httpx.HTTPError as exc:
-                logger.error("Gemini embeddings request failed: %s", exc)
-                raise ProviderError("Gemini embeddings request failed") from exc
+            last_429_response: object | None = None
+            for key in self._keys:
+                headers = {"Content-Type": "application/json", "x-goog-api-key": key}
+                # Pace BEFORE every actual HTTP call so the global RPM budget
+                # covers rotations/retries too.
+                self._pace()
+                try:
+                    response = httpx.post(
+                        url, headers=headers, json=payload, timeout=self._TIMEOUT
+                    )
+                except httpx.HTTPError as exc:
+                    logger.error("Gemini embeddings request failed: %s", exc)
+                    raise ProviderError("Gemini embeddings request failed") from exc
 
-            status = response.status_code
-            # 429 (rate limit) AND transient server errors (500/502/503/504) are
-            # retryable with the same paced backoff — Gemini intermittently returns
-            # 503 "overloaded", which must not fail an otherwise-healthy long
-            # indexing run. Non-transient 4xx (400/401/403/404) are NOT retried.
-            if status == 429 or status in (500, 502, 503, 504):
-                last_exc = (
-                    RateLimitError("Gemini embeddings rate limit exceeded")
-                    if status == 429
-                    else ProviderError(f"Gemini embeddings error (status {status})")
-                )
+                status = response.status_code
+                if status == 429:
+                    # Quota exhausted on this key — rotate to the next key
+                    # IMMEDIATELY with no delay.
+                    last_429_response = response
+                    last_exc = RateLimitError("Gemini embeddings rate limit exceeded")
+                    logger.warning(
+                        "Gemini embeddings 429 on key #%s; rotating to next key.",
+                        self._keys.index(key) + 1,
+                    )
+                    continue
+                # Transient server errors (500/502/503/504) are NOT a quota issue:
+                # back off and retry the SAME key (do not rotate), reusing the
+                # outer pass/backoff loop.
+                if status in (500, 502, 503, 504):
+                    last_exc = ProviderError(f"Gemini embeddings error (status {status})")
+                    if attempt < self._max_retries:
+                        backoff = self._backoff_base * (2**attempt)
+                        retry_after = self._parse_retry_after(response)
+                        delay = min(max(backoff, retry_after), self._max_backoff)
+                        logger.warning(
+                            "Gemini embeddings transient error %s (attempt %s); retrying "
+                            "in %.1fs (backoff=%.1fs retry_after=%.1fs)",
+                            status,
+                            attempt + 1,
+                            delay,
+                            backoff,
+                            retry_after,
+                        )
+                        time.sleep(delay)
+                    # Break the key loop and let the outer pass retry the same key.
+                    break
+                if status >= 400:
+                    logger.error(
+                        "Gemini embeddings error %s: %s",
+                        status,
+                        response.text[:500],
+                    )
+                    raise ProviderError(f"Gemini embeddings error (status {status})")
+
+                try:
+                    values = response.json()["embedding"]["values"]
+                except (KeyError, IndexError, TypeError, ValueError) as exc:
+                    logger.error("Unexpected Gemini embeddings response shape: %s", exc)
+                    raise ProviderError(
+                        "Gemini returned an unexpected embeddings response"
+                    ) from exc
+                return self._normalize(values)
+            else:
+                # The key loop completed without break/return — that only happens
+                # when EVERY key returned 429 on this pass. Apply paced backoff
+                # before retrying the whole ring (honoring Retry-After).
                 if attempt < self._max_retries:
                     backoff = self._backoff_base * (2**attempt)
-                    retry_after = self._parse_retry_after(response)
+                    retry_after = self._parse_retry_after(last_429_response)
                     delay = min(max(backoff, retry_after), self._max_backoff)
                     logger.warning(
-                        "Gemini embeddings transient error %s (attempt %s); retrying in %.1fs "
-                        "(backoff=%.1fs retry_after=%.1fs)",
-                        status,
+                        "Gemini embeddings: all %s key(s) rate-limited (pass %s); retrying "
+                        "in %.1fs (backoff=%.1fs retry_after=%.1fs)",
+                        len(self._keys),
                         attempt + 1,
                         delay,
                         backoff,
@@ -411,23 +488,7 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
                     )
                     time.sleep(delay)
                     continue
-                raise last_exc
-            if status >= 400:
-                logger.error(
-                    "Gemini embeddings error %s: %s",
-                    status,
-                    response.text[:500],
-                )
-                raise ProviderError(
-                    f"Gemini embeddings error (status {status})"
-                )
-
-            try:
-                values = response.json()["embedding"]["values"]
-            except (KeyError, IndexError, TypeError, ValueError) as exc:
-                logger.error("Unexpected Gemini embeddings response shape: %s", exc)
-                raise ProviderError("Gemini returned an unexpected embeddings response") from exc
-            return self._normalize(values)
+                raise last_exc or RateLimitError("Gemini embeddings rate limit exceeded")
 
         # Defensive: only reached if the loop exits without returning/raising.
         raise last_exc or ProviderError("Gemini embeddings request failed")
@@ -504,9 +565,18 @@ def get_embedding_provider() -> EmbeddingProvider:
 
     if provider == "gemini":
         if settings.GEMINI_API_KEY:
-            logger.info("Using Gemini embedding provider (dim=%s)", settings.EMBEDDING_DIM)
+            keys = [
+                k
+                for k in (settings.GEMINI_API_KEY, settings.GEMINI_API_KEY_FALLBACK)
+                if k
+            ]
+            logger.info(
+                "Using Gemini embedding provider (dim=%s, keys=%s)",
+                settings.EMBEDDING_DIM,
+                len(keys),
+            )
             return GeminiEmbeddingProvider(
-                api_key=settings.GEMINI_API_KEY,
+                api_keys=keys,
                 rpm=getattr(settings, "GEMINI_EMBED_RPM", None),
                 max_retries=getattr(settings, "GEMINI_EMBED_MAX_RETRIES", None),
                 backoff_base_seconds=getattr(settings, "GEMINI_EMBED_BACKOFF_BASE_SECONDS", None),
