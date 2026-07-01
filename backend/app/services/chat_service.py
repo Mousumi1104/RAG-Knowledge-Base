@@ -51,6 +51,15 @@ _NO_CONTEXT_ANSWER = (
     "I couldn't find relevant information in the knowledge base to answer your " "question."
 )
 
+# Shown when a provider (embedding OR LLM) fails or its quota is exhausted and we
+# cannot produce a grounded answer. It is a normal, rendered answer (HTTP 200 /
+# delta+done) rather than a 4xx/5xx or a bare SSE ``error`` frame, so the client
+# always displays something instead of a blank screen.
+_SERVICE_BUSY_ANSWER = (
+    "Sorry, I'm having trouble reaching the knowledge service right now — it may be "
+    "temporarily busy or rate-limited. Please try again in a little while."
+)
+
 # Phrases that mark an answer as a "not found"/disclaimer reply. Matched against
 # the answer normalized exactly like ``_is_smalltalk`` does (lowercased,
 # punctuation -> spaces, whitespace collapsed) so e.g. "couldn't" -> "couldn t".
@@ -663,6 +672,8 @@ def stream_answer(
     """
     scope_owner_id = owner_id if retrieval_owner_id is _UNSET else retrieval_owner_id
     db = SessionLocal()
+    conv_id: int | None = None
+    streamed = False
     try:
         cleaned = _sanitize_question(question)
         conversation = resolve_or_create_conversation(
@@ -712,23 +723,43 @@ def stream_answer(
         else:
             effective_history = history
 
-        system, user, sources = _retrieve_and_build_prompt(
-            db,
-            cleaned,
-            top_k,
-            effective_history,
-            scope_owner_id,
-            include_global=include_global,
-            show_global=show_global,
-            employee_name=employee_name,
-            employee_id=employee_id,
-        )
+        try:
+            system, user, sources = _retrieve_and_build_prompt(
+                db,
+                cleaned,
+                top_k,
+                effective_history,
+                scope_owner_id,
+                include_global=include_global,
+                show_global=show_global,
+                employee_name=employee_name,
+                employee_id=employee_id,
+            )
+        except (RateLimitError, ProviderError) as exc:
+            # Retrieval provider quota-end/error: emit a rendered message via the
+            # normal delta+done path so the client shows something instead of a
+            # blank screen or an ignored SSE ``error`` frame.
+            logger.error("stream retrieval provider failure: %s; returning graceful message.", exc)
+            assistant_msg = _save_message(
+                db, conv_id, "assistant", _SERVICE_BUSY_ANSWER, sources=[]
+            )
+            yield ("delta", _SERVICE_BUSY_ANSWER)
+            yield (
+                "done",
+                {
+                    "sources": [],
+                    "conversation_id": conv_id,
+                    "message_id": assistant_msg.id,
+                },
+            )
+            return
 
         chunks: list[str] = []
         for delta in _stream_answer_deltas(system, user):
             if not delta:
                 continue
             chunks.append(delta)
+            streamed = True
             yield ("delta", delta)
 
         full_answer = "".join(chunks) or _NO_CONTEXT_ANSWER
@@ -751,7 +782,16 @@ def stream_answer(
             db.rollback()
         except Exception:  # noqa: BLE001
             pass
-        yield ("error", "An error occurred while generating the answer.")
+        # Emit the friendly message via the normal delta+done path (the client
+        # ignores bare ``error`` frames, which is why the UI showed nothing). If
+        # some answer text already streamed, skip the extra delta and just send a
+        # ``done`` so the client finalizes cleanly.
+        if not streamed:
+            yield ("delta", _SERVICE_BUSY_ANSWER)
+        yield (
+            "done",
+            {"sources": [], "conversation_id": conv_id, "message_id": None},
+        )
     finally:
         db.close()
 
@@ -832,16 +872,32 @@ def query(
     else:
         effective_history = history
 
-    system, user, sources = _retrieve_and_build_prompt(
-        db,
-        cleaned,
-        top_k,
-        effective_history,
-        scope_owner_id,
-        include_global=include_global,
-        show_global=show_global,
-    )
-    answer = _generate_answer(system, user)
+    # Retrieval embeds the query with the cloud provider, which RAISES on a
+    # persistent 429/5xx (it never substitutes an incompatible local vector).
+    # Generation self-falls-back to the local provider, so only retrieval can
+    # surface a provider error here. Catch it and return a rendered, relevant
+    # message (HTTP 200) so the client never shows a blank screen on quota-end.
+    try:
+        system, user, sources = _retrieve_and_build_prompt(
+            db,
+            cleaned,
+            top_k,
+            effective_history,
+            scope_owner_id,
+            include_global=include_global,
+            show_global=show_global,
+        )
+        answer = _generate_answer(system, user)
+    except (RateLimitError, ProviderError) as exc:
+        logger.error("Provider failure during retrieval/generation: %s; returning graceful message.", exc)
+        answer, sources = _SERVICE_BUSY_ANSWER, []
+    except Exception as exc:  # noqa: BLE001 - never 500 the chat endpoint
+        logger.exception("Unexpected chat failure: %s; returning graceful message.", exc)
+        answer, sources = _SERVICE_BUSY_ANSWER, []
+
+    # Guard against an empty/blank generation so the client always renders text.
+    if not answer or not answer.strip():
+        answer = _NO_CONTEXT_ANSWER
 
     # The answer disclaims having found anything: drop sources so we don't
     # surface chips that didn't actually back the answer.

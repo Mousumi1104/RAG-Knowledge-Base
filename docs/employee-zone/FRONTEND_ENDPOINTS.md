@@ -2,7 +2,7 @@
 
 Short guide for the mobile team. These are the **new `/employee/*` endpoints** for the in-app chatbot.
 
-- **Base URL (live Render):** `https://rag-knowledge-base-api.onrender.com` *(confirm the exact host in the Render dashboard)*
+- **Base URL (live Render):** `https://rag-knowledge-base-86tb.onrender.com` *(confirm the exact host in the Render dashboard)*
 - **Auth right now:** **none required** — authentication is intentionally OFF for this first version. Just call the endpoints.
 - **Optional identity:** to keep each employee's chat history separate, send these headers (unverified for now):
   - `X-Employee-Email: jane@company.com` *(recommended — used to separate conversations per person)*
@@ -37,7 +37,7 @@ Response:
 
 curl:
 ```bash
-curl -X POST https://rag-knowledge-base-api.onrender.com/employee/chat/query \
+curl -X POST https://rag-knowledge-base-86tb.onrender.com/employee/chat/query \
   -H "Content-Type: application/json" \
   -H "X-Employee-Email: jane@company.com" \
   -d '{"query":"How many casual leaves do I get?"}'
@@ -45,8 +45,10 @@ curl -X POST https://rag-knowledge-base-api.onrender.com/employee/chat/query \
 
 ### 2. Ask a question (streaming, live typing) — optional
 `POST /employee/chat/stream` — Server-Sent Events.
-Frames: `data: {"delta":"..."}` per token, then `data: {"done":true,"sources":[...],"conversation_id":N,"message_id":M}`, or `data: {"error":"..."}`.
+Frames: `data: {"delta":"..."}` per token, then `data: {"done":true,"sources":[...],"conversation_id":N,"message_id":M}`.
 Note: this is a **POST** (not browser `EventSource`). Use `/employee/chat/query` if streaming is fiddly on mobile.
+
+**Errors / quota exhaustion:** you always get a rendered answer, never a blank screen. If a provider (embedding or LLM) fails or its quota is exhausted, `/query` still returns `200` with a friendly `answer` (empty `sources`), and `/stream` emits that message as a normal `delta`+`done` pair. (A legacy `data: {"error":"..."}` frame is no longer emitted for provider failures.)
 
 ### 3. Start a new conversation
 `POST /employee/chat/conversations` → `201` `{ "id": 101, ... }`
