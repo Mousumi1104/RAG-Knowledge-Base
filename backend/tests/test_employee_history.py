@@ -189,3 +189,5 @@ def test_identity_preamble_stripped_from_stored_user_text(client, monkeypatch) -
 
     detail = client.get(f"/employee/chat/conversations/{conv_id}", headers=_headers()).json()
     assert detail["messages"][0]["content"] == "What is the leave policy?"
+    # The derived title is also preamble-free (reads cleanly in the history list).
+    assert detail["title"] == "What is the leave policy?"

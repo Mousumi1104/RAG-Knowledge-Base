@@ -398,7 +398,8 @@ def answer(
         employee_id=employee_id,
         email=email,
         name=name,
-        question=cleaned or (question or ""),
+        # Title derives from the preamble-stripped text so history reads cleanly.
+        question=stored_user or (question or ""),
         conversation_id=conversation_id,
     )
 
@@ -482,7 +483,8 @@ def answer_stream(
             employee_id=employee_id,
             email=email,
             name=name,
-            question=cleaned or (question or ""),
+            # Title derives from the preamble-stripped text so history reads cleanly.
+            question=stored_user or (question or ""),
             conversation_id=conversation_id,
         )
         conv_id = conv.id
