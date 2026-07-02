@@ -19,9 +19,15 @@ class Employee(Base, TimestampStatusMixin):
 
     __tablename__ = "employees"
 
-    # Must match collaboration_days.employee_name.
+    # The DISPLAY name (used in the email/FCM greeting).
     name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    # Optional schedule alias: when the collaboration schedule distinguishes two
+    # same-named people (e.g. "Sneha Mondal" vs "Sneha Mondal (Intern)"), this
+    # holds the exact schedule label to match collaboration_days.employee_name.
+    # NULL means the schedule uses the display ``name`` verbatim. The greeting
+    # always uses ``name``, never this alias.
+    schedule_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # Owner key.
     employee_id: Mapped[str] = mapped_column(
         String(255), nullable=False, unique=True

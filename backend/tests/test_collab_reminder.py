@@ -195,6 +195,130 @@ def test_dry_run_disabled_writes_no_ledger(collab_setup):
     assert rows == []
 
 
+# Two DIFFERENT people share the display name "Sneha Mondal"; the schedule
+# distinguishes them via the "(Intern)" alias. These identities are unique so
+# they never collide with the other fixtures / leftover rows.
+_SNEHA_NAME = "Sneha Mondal"
+_SNEHA_INTERN_SCHEDULE = "Sneha Mondal (Intern)"
+_PLAIN_OWNER = "TEST_BP057_SNEHA"
+_PLAIN_EMAIL = "test.sneha.plain@example.com"
+_INTERN_OWNER = "TEST_BPI101_SNEHA"
+_INTERN_EMAIL = "test.sneha.intern@example.com"
+
+
+def _cleanup_sneha(db) -> None:
+    """Remove every row the same-name Sneha test may have created."""
+    db.execute(
+        delete(ReminderSent).where(
+            ReminderSent.owner.in_([_PLAIN_OWNER, _INTERN_OWNER])
+        )
+    )
+    db.execute(
+        delete(Employee).where(
+            Employee.employee_id.in_([_PLAIN_OWNER, _INTERN_OWNER])
+        )
+    )
+    db.execute(
+        delete(CollaborationDay).where(
+            CollaborationDay.employee_name.in_(
+                [_SNEHA_NAME, _SNEHA_INTERN_SCHEDULE]
+            )
+        )
+    )
+    db.commit()
+
+
+def test_schedule_name_alias_disambiguates_same_display_name(db, monkeypatch):
+    """Two employees named "Sneha Mondal" match DISJOINT schedule rows.
+
+    The alias (``schedule_name="Sneha Mondal (Intern)"``) routes the intern to
+    ONLY the "(Intern)" schedule rows; the plain employee (no alias) matches
+    ONLY the plain rows. Each fires its OWN send + its OWN dedup-ledger row
+    (two independent owners), and BOTH greetings use the display name
+    "Sneha Mondal" — never "(Intern)".
+    """
+    _cleanup_sneha(db)
+    target = _target_date()
+
+    # Two distinct people, same display name; one carries the schedule alias.
+    db.add(
+        Employee(
+            employee_id=_PLAIN_OWNER, name=_SNEHA_NAME, email=_PLAIN_EMAIL,
+            schedule_name=None, status=Status.ACTIVE.value,
+        )
+    )
+    db.add(
+        Employee(
+            employee_id=_INTERN_OWNER, name=_SNEHA_NAME, email=_INTERN_EMAIL,
+            schedule_name=_SNEHA_INTERN_SCHEDULE, status=Status.ACTIVE.value,
+        )
+    )
+    # Two schedule rows: the plain label and the "(Intern)" label, both tomorrow.
+    db.add(
+        CollaborationDay(
+            employee_name=_SNEHA_NAME, date=target, weekday="Tue",
+            ws="9", room="Room 11", status=Status.ACTIVE.value,
+        )
+    )
+    db.add(
+        CollaborationDay(
+            employee_name=_SNEHA_INTERN_SCHEDULE, date=target, weekday="Wed",
+            ws="10", room="Room 12", status=Status.ACTIVE.value,
+        )
+    )
+    db.commit()
+
+    email_calls: list[tuple] = []
+    monkeypatch.setattr(
+        collab_reminder, "send_fcm", lambda *a, **k: {"status": "sent"},
+    )
+    monkeypatch.setattr(
+        collab_reminder, "send_email",
+        lambda *a, **k: email_calls.append((a, k)) or {"status": "sent"},
+    )
+
+    try:
+        summary = collab_reminder.main(db)
+
+        # Both employees matched a schedule row and sent via email (no tokens).
+        # (Other ACTIVE employees may exist in the shared DB, so assert >= and
+        # then pin the exact behaviour for OUR two owners below.)
+        assert summary["sent_email"] >= 2
+
+        # Exactly one email per owner: the two owners each fired independently.
+        by_addr = {a[0][0]: a[0] for a in email_calls}
+        assert _PLAIN_EMAIL in by_addr
+        assert _INTERN_EMAIL in by_addr
+        plain_addrs = [a for a in email_calls if a[0][0] == _PLAIN_EMAIL]
+        intern_addrs = [a for a in email_calls if a[0][0] == _INTERN_EMAIL]
+        assert len(plain_addrs) == 1
+        assert len(intern_addrs) == 1
+
+        # Each owner got its OWN dedup-ledger row (two independent owners).
+        plain_ledger = db.execute(
+            select(ReminderSent).where(ReminderSent.owner == _PLAIN_OWNER)
+        ).scalars().all()
+        intern_ledger = db.execute(
+            select(ReminderSent).where(ReminderSent.owner == _INTERN_OWNER)
+        ).scalars().all()
+        assert len(plain_ledger) == 1
+        assert len(intern_ledger) == 1
+
+        # BOTH greetings use the DISPLAY name, never the "(Intern)" alias. The
+        # body is the 3rd positional arg to send_email(to, subject, body).
+        for args in (by_addr[_PLAIN_EMAIL], by_addr[_INTERN_EMAIL]):
+            body = args[2]
+            assert "Dear Sneha Mondal," in body
+            assert "(Intern)" not in body
+
+        # The intern's schedule row carried Room 12; the plain one Room 11 — a
+        # cross-check that the alias matched DISJOINT rows (not swapped/shared).
+        assert "Room 12" in by_addr[_INTERN_EMAIL][2]
+        assert "Room 11" in by_addr[_PLAIN_EMAIL][2]
+    finally:
+        _cleanup_sneha(db)
+
+
 def test_seed_employees_upserts_and_is_idempotent(db):
     """Seed the 22-row sample roster; re-run updates (idempotent) not inserts."""
     assert _SAMPLE_ROSTER.exists(), f"sample roster missing: {_SAMPLE_ROSTER}"

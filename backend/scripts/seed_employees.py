@@ -1,8 +1,9 @@
 """Idempotent seeder for the ``employees`` directory table.
 
 Reads a JSON roster file — a list of ``{"employee_id", "name", "email"}``
-objects — and upserts each row keyed by the UNIQUE ``employee_id`` (name/email
-are updated in place on re-run, and a soft-deleted row is re-activated).
+objects (with an optional ``schedule_name`` collab-schedule alias) — and upserts
+each row keyed by the UNIQUE ``employee_id`` (name/email/schedule_name are
+updated in place on re-run, and a soft-deleted row is re-activated).
 
 The roster is NEVER hardcoded here: the real data file is supplied at deploy
 time. The path is resolved from (in order): ``argv[1]``, the
@@ -66,6 +67,9 @@ def seed_employees(db, roster: list[dict]) -> tuple[int, int]:
         employee_id = (row.get("employee_id") or "").strip()
         name = (row.get("name") or "").strip()
         email = (row.get("email") or "").strip() or None
+        # Optional collab-schedule alias (e.g. "Sneha Mondal (Intern)"); NULL when
+        # absent so the reminder job falls back to the display name.
+        schedule_name = (row.get("schedule_name") or "").strip() or None
         if not employee_id or not name:
             logger.warning("Skipping roster row (missing employee_id/name): %r", row)
             continue
@@ -80,6 +84,7 @@ def seed_employees(db, roster: list[dict]) -> tuple[int, int]:
                     employee_id=employee_id,
                     name=name,
                     email=email,
+                    schedule_name=schedule_name,
                     status=Status.ACTIVE.value,
                 )
             )
@@ -87,6 +92,7 @@ def seed_employees(db, roster: list[dict]) -> tuple[int, int]:
         else:
             existing.name = name
             existing.email = email
+            existing.schedule_name = schedule_name
             existing.status = Status.ACTIVE.value
             updated += 1
 

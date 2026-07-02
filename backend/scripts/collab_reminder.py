@@ -145,7 +145,11 @@ def main(db) -> dict:
     )
 
     for emp in employees:
-        nxt = collaboration_service.next_collab_day(db, emp.name, today)
+        # Match the SCHEDULE by the alias when set (distinguishes two same-named
+        # people, e.g. "Sneha Mondal" vs "Sneha Mondal (Intern)"); fall back to
+        # the display name. The greeting below always uses emp.name (display).
+        schedule_name = emp.schedule_name or emp.name
+        nxt = collaboration_service.next_collab_day(db, schedule_name, today)
         if nxt is None or nxt.date != target:
             continue
 
