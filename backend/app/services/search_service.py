@@ -63,6 +63,21 @@ _OVERFETCH_MIN_CANDIDATES = 500
 # genuine semantic relevance for paraphrased queries (overlap there is low).
 _KEYWORD_WEIGHT = 0.45
 
+# Deterministic lexical anchor for rare, short, acronym-like query tokens. The
+# live Gemini embedder embeds the query WITHOUT case normalization, so a
+# lowercase acronym (e.g. "apdr") gets an off-topic vector even though the chunk
+# that defines it is a certain lexical match. When such a rare token is literally
+# present in a chunk, we add a fixed bonus large enough to (a) lift that chunk to
+# #0 and (b) clear the downstream Gemini relevance floor (0.40) on its own, even
+# when the lowercase vector score is ~0. Confined to rare acronym-like tokens so
+# ordinary content queries are unaffected.
+#   - _ACRONYM_TOKEN_RE: 2-6 char alphanumeric token (lowercased query word).
+#   - _EXACT_TOKEN_ANCHOR_BONUS: >0.40 so the bonus alone clears the floor.
+#   - _ACRONYM_MIN_IDF: only rare/discriminative tokens (pool-IDF >= this) anchor.
+_ACRONYM_TOKEN_RE = re.compile(r"^[a-z0-9]{2,6}$")
+_EXACT_TOKEN_ANCHOR_BONUS = 0.50
+_ACRONYM_MIN_IDF = 1.5
+
 # Extra bonus for a chunk that literally INTRODUCES the queried term, i.e. the
 # word "Definition" immediately precedes a query content-term (e.g. "Definition
 # The transpose of ..."). For a definition-seeking query this is the gold chunk,
@@ -239,6 +254,25 @@ def _weighted_keyword_overlap(
         return 0.0
     matched = sum(idf.get(w, 1.0) for w in query_words if w in lowered)
     return matched / total
+
+
+def _acronym_anchor_terms(query_words: set[str], idf: dict[str, float]) -> set[str]:
+    """Rare, short, acronym-like query terms that should deterministically anchor.
+
+    Returns the subset of ``query_words`` that both (a) look like an acronym/short
+    code (match :data:`_ACRONYM_TOKEN_RE`) AND (b) are rare/discriminative in the
+    candidate pool (pool-IDF >= :data:`_ACRONYM_MIN_IDF`). A term literally present
+    in a chunk then earns :data:`_EXACT_TOKEN_ANCHOR_BONUS`, which is enough to
+    lift that chunk to #0 and clear the downstream relevance floor even when the
+    live embedder gave the (lowercase) query an off-topic vector. Common words and
+    ordinary long content terms never qualify, so non-acronym queries are
+    unaffected.
+    """
+    return {
+        term
+        for term in query_words
+        if _ACRONYM_TOKEN_RE.match(term) and idf.get(term, 1.0) >= _ACRONYM_MIN_IDF
+    }
 
 
 def _is_question_list_chunk(content: str) -> bool:
@@ -470,12 +504,23 @@ def search(
         ]
         idf = _pool_idf_weights(query_words, pool_contents)
 
+        # Rare, acronym-like query tokens that should deterministically anchor a
+        # chunk literally containing them (see _acronym_anchor_terms). Computed
+        # once from the already-built pool IDF; empty for ordinary queries.
+        anchor_terms = _acronym_anchor_terms(query_words, idf)
+
         definition_query = _is_definition_query(query)
         for hit in hits:
             metadata = hit.get("metadata") or {}
             content = str(metadata.get("content") or hit.get("document") or "")
+            content_lower = content.lower()
             overlap = _weighted_keyword_overlap(query_words, content, idf)
             rank_score = float(hit.get("score", 0.0)) + _KEYWORD_WEIGHT * overlap
+            # A rare acronym-like query token literally present in this chunk
+            # deterministically lifts it: the bonus alone clears the 0.40 relevance
+            # floor even when the lowercase query got an off-topic vector (~0).
+            if anchor_terms and any(t in content_lower for t in anchor_terms):
+                rank_score += _EXACT_TOKEN_ANCHOR_BONUS
             # For a "what is X" query, decisively prefer the chunk that literally
             # defines X (e.g. "Definition The transpose of ...") over the many
             # chunks that only mention X with a slightly better vector score.
