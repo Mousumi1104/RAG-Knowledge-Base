@@ -137,6 +137,11 @@ class Settings(BaseSettings):
     # opening a socket. Real sending is only enabled when this is True AND the
     # relevant credentials below are present.
     NOTIFICATIONS_ENABLED: bool = False
+    # Shared secret gating the internal cron-trigger endpoint
+    # (POST /internal/run-collab-reminders). When None/empty, the endpoint is
+    # disabled (503) so the job can never be triggered without an explicit
+    # secret. Set it in Render AND as the CRON_SECRET GitHub Actions secret.
+    CRON_SECRET: str | None = None
     # Firebase Cloud Messaging (push): supply EITHER the full service-account
     # JSON as a string (FIREBASE_CREDENTIALS_JSON) OR a path to the JSON file
     # (GOOGLE_APPLICATION_CREDENTIALS). Either one satisfies the creds check.
