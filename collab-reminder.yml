@@ -1,0 +1,30 @@
+name: collab-reminder
+
+# Daily collaboration-day reminder trigger.
+#
+# Render's free plan has no cron/Blueprint scheduler, so this free GitHub
+# Actions scheduled workflow pokes a secret-gated HTTP endpoint on the web
+# service instead (POST /internal/run-collab-reminders). The job itself honors
+# NOTIFICATIONS_ENABLED, so nothing is sent while notifications are disabled.
+#
+# NOTE: GitHub scheduled crons are best-effort and can be delayed a few minutes
+# (or occasionally skipped under heavy load); this is fine for an evening-before
+# reminder. Use the workflow_dispatch button to trigger a run manually.
+on:
+  schedule:
+    - cron: "30 13 * * *"  # 13:30 UTC = 19:00 IST (evening before the collab day)
+  workflow_dispatch: {}
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: POST /internal/run-collab-reminders
+        run: |
+          # -f fails the job on any non-2xx response; the retries tolerate a
+          # free-tier cold start (the service may need to spin up).
+          response=$(curl -fsS -X POST \
+            https://rag-knowledge-base-86tb.onrender.com/internal/run-collab-reminders \
+            -H "X-Cron-Secret: ${{ secrets.CRON_SECRET }}" \
+            --max-time 120 --retry 3 --retry-connrefused --retry-delay 30)
+          echo "Response: $response"
