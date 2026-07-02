@@ -156,6 +156,14 @@ _QUERY_SYNONYMS: dict[str, frozenset[str]] = {
     "obtain": frozenset({"providers", "provider", "vendor"}),
     "buy": frozenset({"providers", "provider", "vendor"}),
     "purchase": frozenset({"providers", "provider", "vendor"}),
+    # "colab" is a common abbreviation of "collaboration" but is NOT a substring
+    # of it (double-l), so the ILIKE keyword-rescue path matches nothing for
+    # "colab" and retrieval then leans ENTIRELY on the embedding's semantic
+    # bridge. Mapping colab->collaboration lets the lexical path also reach the
+    # Collaboration Schedule doc, hardening the abbreviation against any
+    # embedding-provider fallback (local hashing embedder cannot bridge it).
+    "colab": frozenset({"collaboration", "collab"}),
+    "collab": frozenset({"collaboration"}),
 }
 
 
@@ -396,6 +404,7 @@ def search(
     *,
     owner_id: int | None,
     include_global: bool = True,
+    extra_keyword_terms: list[str] | None = None,
 ) -> list[dict]:
     """Run semantic search and return ranked, active-only, tenant-scoped results.
 
@@ -417,6 +426,13 @@ def search(
 
             {document_id, document_name, excerpt, chunk_id, page, score,
              rank_score, owner_id, is_global}
+
+        extra_keyword_terms: Additional lexical terms folded ONLY into the
+            keyword/overlap side of the hybrid re-rank (never embedded). The
+            Employee Zone passes the asking employee's name here so the semantic
+            query stays the clean question (e.g. "what are the next colab
+            days?") while the name still lexically surfaces that employee's own
+            rows in a names x dates schedule. Empty/None is a no-op.
 
         ``score`` is the raw vector similarity; ``rank_score`` is the blended
         hybrid score used for ordering and for the downstream relevance gate.
@@ -467,6 +483,14 @@ def search(
     # The original vector ``score`` is left untouched on every hit for output and
     # for the downstream relevance threshold.
     query_words = _content_words(query)
+    # Fold in caller-supplied keyword-only terms (e.g. the asking employee's
+    # name) so they drive the ILIKE injection + IDF-weighted overlap WITHOUT ever
+    # entering the embedding. These are tokenized/stopword-filtered like the query
+    # itself; proper-noun name tokens are rare (high pool-IDF), so a chunk that
+    # literally contains the name is decisively lifted over generic rows.
+    if extra_keyword_terms:
+        for term in extra_keyword_terms:
+            query_words |= _content_words(term)
     if query_words:
         # Expand with light synonym vocabulary so the lexical rescue can bridge a
         # phrasing/vocabulary gap (e.g. "avail" -> "providers") the IDF-free

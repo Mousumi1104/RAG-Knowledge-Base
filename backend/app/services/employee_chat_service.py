@@ -53,7 +53,10 @@ _PREVIEW_CHARS = 80
 
 # Leading identity preamble the EZ app prepends to the query
 # (``(For context, I am <name> ...)``); stripped before persisting user content
-# so history reads cleanly. Retrieval still uses the full query text.
+# so history reads cleanly. The preamble-stripped question is also what feeds
+# retrieval and the prompt now — the identity reaches the model via the
+# ``employee_name``/``employee_id`` prompt line and the name is folded into the
+# lexical (keyword) side of retrieval, never into the semantic embedding.
 _PREAMBLE_RE = re.compile(r"^\s*\(\s*for context, i am\b.*?\)\s*", re.IGNORECASE | re.DOTALL)
 
 
@@ -421,7 +424,9 @@ def answer(
     try:
         system, user, sources = cs._retrieve_and_build_prompt(
             db,
-            cleaned,
+            # Semantic query is the preamble-STRIPPED question so the identity
+            # ("I am <name>, employee ID <id>") never pollutes the embedding.
+            stored_user,
             top_k,
             effective_history,
             scope_owner,
@@ -429,6 +434,9 @@ def answer(
             show_global=True,
             employee_name=name,
             employee_id=employee_id,
+            # ...but the name still drives the lexical side, so a names x dates
+            # schedule surfaces THIS employee's own rows (see search_service).
+            retrieval_keyword_terms=[name] if name else None,
         )
         ans = cs._generate_answer(system, user)
     except (RateLimitError, ProviderError) as exc:
@@ -510,7 +518,9 @@ def answer_stream(
         try:
             system, user, sources = cs._retrieve_and_build_prompt(
                 db,
-                cleaned,
+                # Preamble-STRIPPED question on the semantic side (identity never
+                # enters the embedding); name folded into the lexical side below.
+                stored_user,
                 top_k,
                 effective_history,
                 scope_owner,
@@ -518,6 +528,7 @@ def answer_stream(
                 show_global=True,
                 employee_name=name,
                 employee_id=employee_id,
+                retrieval_keyword_terms=[name] if name else None,
             )
         except (RateLimitError, ProviderError) as exc:
             logger.error("Employee stream provider failure: %s; graceful message.", exc)

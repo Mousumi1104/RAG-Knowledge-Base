@@ -537,6 +537,7 @@ def _retrieve_and_build_prompt(
     show_global: bool = False,
     employee_name: str | None = None,
     employee_id: str | None = None,
+    retrieval_keyword_terms: list[str] | None = None,
 ) -> tuple[str, str, list[dict]]:
     """Retrieve scoped context and build the grounded prompt.
 
@@ -558,6 +559,7 @@ def _retrieve_and_build_prompt(
         top_k=top_k,
         owner_id=owner_id,
         include_global=include_global,
+        extra_keyword_terms=retrieval_keyword_terms,
     )
     # Select context on the blended hybrid ``rank_score``: an absolute relevance
     # gate, then a relative (fraction-of-top) floor so off-topic chunks from
