@@ -12,8 +12,8 @@ Currently exposed:
   ``NOTIFICATIONS_ENABLED``, so this endpoint sends NOTHING while notifications
   are disabled; it simply reports the dry-run summary.
 - ``POST /internal/test-email`` — send ONE email to a specified address to
-  verify SMTP delivery. This EXPLICIT operator test bypasses
-  ``NOTIFICATIONS_ENABLED`` but still requires SMTP creds (else 503).
+  verify email delivery (Brevo HTTP API or SMTP). This EXPLICIT operator test
+  bypasses ``NOTIFICATIONS_ENABLED`` but still requires email creds (else 503).
 """
 
 from __future__ import annotations
@@ -87,20 +87,21 @@ class TestEmailRequest(BaseModel):
 
 @router.post("/test-email", dependencies=[Depends(require_cron_secret)])
 def test_email(req: TestEmailRequest) -> dict:
-    """Send ONE test email to ``req.to`` to verify SMTP (Brevo) delivery.
+    """Send ONE test email to ``req.to`` to verify email (Brevo/SMTP) delivery.
 
     Guarded by :func:`require_cron_secret`. This is an EXPLICIT operator test: it
     bypasses the global ``NOTIFICATIONS_ENABLED`` switch (calling the low-level
-    :func:`notifications._smtp_send` directly) but still requires SMTP creds
-    (``SMTP_HOST`` + ``MAIL_FROM``) — without them it returns 503. It sends ONLY
-    to the single ``to`` address and returns the raw send result JSON.
+    :func:`notifications._send_email_now` directly) but still requires email
+    creds — a sender (``MAIL_FROM``) AND at least one transport (``BREVO_API_KEY``
+    OR ``SMTP_HOST``) — without them it returns 503. It sends ONLY to the single
+    ``to`` address and returns the raw send result JSON.
     """
-    if not notifications.smtp_configured():
+    if not notifications.email_configured():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="SMTP not configured (need SMTP_HOST + MAIL_FROM)",
+            detail="email not configured (need MAIL_FROM + BREVO_API_KEY or SMTP_HOST)",
         )
-    result = notifications._smtp_send(
+    result = notifications._send_email_now(
         req.to,
         subject="[TEST] Collab reminder email",
         body=(

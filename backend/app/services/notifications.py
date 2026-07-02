@@ -114,14 +114,56 @@ def send_fcm(token: str, title: str, body: str, data: dict) -> dict:
         return {"status": "error", "detail": str(exc)}
 
 
-def smtp_configured() -> bool:
-    """True when the minimal SMTP creds (host + from-address) are present.
+def email_configured() -> bool:
+    """True when a sender + at least one transport (Brevo OR SMTP) are present.
 
-    Independent of ``NOTIFICATIONS_ENABLED`` — this only asks "could we open an
-    SMTP connection?", which the operator test-email endpoint uses to decide
-    between 503 (unconfigured) and an actual send attempt.
+    Independent of ``NOTIFICATIONS_ENABLED`` — this only asks "could we deliver
+    an email at all?", which the operator test-email endpoint uses to decide
+    between 503 (unconfigured) and an actual send attempt. Delegates to the
+    :attr:`Settings.email_configured` property.
     """
-    return bool(settings.SMTP_HOST and settings.MAIL_FROM)
+    return bool(settings.email_configured)
+
+
+def _brevo_send(to: str, subject: str, body: str) -> dict:
+    """Low-level send via Brevo's HTTP transactional API (never gated).
+
+    Used where outbound SMTP is blocked (e.g. Render's free tier). Assumes
+    ``BREVO_API_KEY`` + ``MAIL_FROM`` are present (callers check). Brevo returns
+    HTTP 201 on success.
+
+    Returns:
+        ``{"status": "sent", "provider": "brevo"}`` on a 2xx, or
+        ``{"status": "error", "detail": ...}`` on a non-2xx / exception. Never
+        raises.
+    """
+    try:
+        import httpx
+
+        resp = httpx.post(
+            "https://api.brevo.com/v3/smtp/email",
+            headers={
+                "api-key": settings.BREVO_API_KEY or "",
+                "accept": "application/json",
+                "content-type": "application/json",
+            },
+            json={
+                "sender": {"email": settings.MAIL_FROM},
+                "to": [{"email": to}],
+                "subject": subject,
+                "textContent": body,
+            },
+            timeout=30.0,
+        )
+        if 200 <= resp.status_code < 300:
+            logger.info("email sent via brevo: to=%r subject=%r", to, subject)
+            return {"status": "sent", "provider": "brevo"}
+        detail = f"{resp.status_code}: {resp.text[:300]}"
+        logger.error("brevo send failed to=%r: %s", to, detail)
+        return {"status": "error", "detail": detail}
+    except Exception as exc:  # noqa: BLE001 - a send failure must not abort the batch
+        logger.error("brevo send raised to=%r: %s", to, exc)
+        return {"status": "error", "detail": str(exc)}
 
 
 def _smtp_send(to: str, subject: str, body: str) -> dict:
@@ -158,12 +200,35 @@ def _smtp_send(to: str, subject: str, body: str) -> dict:
         return {"status": "error", "detail": str(exc)}
 
 
-def send_email(to: str, subject: str, body: str) -> dict:
-    """Send a plain-text email over SMTP (dry-run unless enabled + creds present).
+def _send_email_now(to: str, subject: str, body: str) -> dict:
+    """Really send an email, choosing a transport (never gated on enablement).
+
+    Prefers Brevo's HTTP API when ``BREVO_API_KEY`` is set (works where SMTP is
+    firewalled); otherwise falls back to raw SMTP when ``SMTP_HOST`` is set. Used
+    both by :func:`send_email` (after its dry-run guard passes) and directly by
+    the operator test-email endpoint.
 
     Returns:
-        ``{"status": "dry_run"}`` when gated off, ``{"status": "sent"}`` on a
-        successful real send, or ``{"status": "error", "detail": ...}`` on a
+        the transport's ``{"status": "sent", ...}`` / ``{"status": "error",
+        "detail": ...}`` dict, or ``{"status": "error", "detail": "no email
+        transport configured"}`` when neither transport is set. Never raises.
+    """
+    if settings.BREVO_API_KEY:
+        return _brevo_send(to, subject, body)
+    if settings.SMTP_HOST:
+        return _smtp_send(to, subject, body)
+    return {"status": "error", "detail": "no email transport configured"}
+
+
+def send_email(to: str, subject: str, body: str) -> dict:
+    """Send a plain-text email (dry-run unless enabled + creds present).
+
+    Delivery uses Brevo's HTTP API when configured, else SMTP (see
+    :func:`_send_email_now`).
+
+    Returns:
+        ``{"status": "dry_run"}`` when gated off, ``{"status": "sent", ...}`` on
+        a successful real send, or ``{"status": "error", "detail": ...}`` on a
         swallowed failure. Never raises.
     """
     if not settings.email_ready:
@@ -172,4 +237,4 @@ def send_email(to: str, subject: str, body: str) -> dict:
         )
         return {"status": "dry_run"}
 
-    return _smtp_send(to, subject, body)
+    return _send_email_now(to, subject, body)

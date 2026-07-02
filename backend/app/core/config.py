@@ -8,7 +8,7 @@ activates the local fallback providers.
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Annotated
+from typing import Annotated, Any
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -147,8 +147,15 @@ class Settings(BaseSettings):
     # (GOOGLE_APPLICATION_CREDENTIALS). Either one satisfies the creds check.
     FIREBASE_CREDENTIALS_JSON: str | None = None
     GOOGLE_APPLICATION_CREDENTIALS: str | None = None
-    # Email (SMTP) fallback channel.
+    # Email fallback channel. Two transports are supported, preferred in order:
+    #   1. Brevo HTTP transactional API (BREVO_API_KEY) — used on hosts (e.g.
+    #      Render free tier) that block outbound SMTP ports.
+    #   2. Plain SMTP (SMTP_HOST + smtplib) — the original transport.
+    # MAIL_FROM is the verified sender for BOTH.
     MAIL_FROM: str | None = None
+    # Brevo (https://www.brevo.com) transactional-email API key. When set it
+    # takes precedence over SMTP so email works even where SMTP is firewalled.
+    BREVO_API_KEY: str | None = None
     SMTP_HOST: str | None = None
     SMTP_PORT: int = 587
     SMTP_USERNAME: str | None = None
@@ -164,11 +171,21 @@ class Settings(BaseSettings):
         )
 
     @property
-    def email_ready(self) -> bool:
-        """True only when notifications are on AND minimal SMTP config exists."""
+    def email_configured(self) -> bool:
+        """True when a sender AND at least one transport (Brevo OR SMTP) exist.
+
+        Independent of ``NOTIFICATIONS_ENABLED`` — this only asks "could we
+        deliver an email at all?", which the operator test-email endpoint uses
+        to decide between 503 (unconfigured) and an actual send attempt.
+        """
         return bool(
-            self.NOTIFICATIONS_ENABLED and self.SMTP_HOST and self.MAIL_FROM
+            self.MAIL_FROM and (self.BREVO_API_KEY or self.SMTP_HOST)
         )
+
+    @property
+    def email_ready(self) -> bool:
+        """True only when notifications are on AND email is deliverable."""
+        return bool(self.NOTIFICATIONS_ENABLED and self.email_configured)
 
     @property
     def cloudinary_enabled(self) -> bool:
@@ -178,6 +195,21 @@ class Settings(BaseSettings):
             and self.CLOUDINARY_API_KEY
             and self.CLOUDINARY_API_SECRET
         )
+
+    @field_validator("SMTP_USE_TLS", "NOTIFICATIONS_ENABLED", mode="before")
+    @classmethod
+    def _bool_default_on_empty(cls, value: object, info: Any) -> object:
+        """Never let an empty/whitespace bool env var crash boot.
+
+        A stray ``SMTP_USE_TLS=`` (empty string) in the environment previously
+        raised a ``ValidationError`` at import time and took the whole service
+        down. Here an empty/whitespace string (or ``None``) falls back to the
+        field's declared default; any other value is passed through untouched so
+        pydantic still coerces ``'true'``/``'false'``/``'1'``/``'0'`` normally.
+        """
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return cls.model_fields[info.field_name].default
+        return value
 
     @field_validator("ALLOWED_EXTENSIONS", "CORS_ORIGINS", mode="before")
     @classmethod

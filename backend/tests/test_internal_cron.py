@@ -211,3 +211,139 @@ def test_reminder_job_dry_run_path_unaffected():
     from app.services import notifications
 
     assert notifications.send_email("to@example.com", "s", "b") == {"status": "dry_run"}
+
+
+# ---------------------------------------------------------------------------
+# Brevo HTTP transport — the transactional-API path used where SMTP is blocked.
+# ---------------------------------------------------------------------------
+class _FakeResp:
+    """Minimal httpx.Response stand-in for stubbed ``httpx.post`` calls."""
+
+    def __init__(self, status_code: int, text: str = ""):
+        self.status_code = status_code
+        self.text = text
+
+
+def _use_brevo(monkeypatch, *, enabled: bool = False) -> None:
+    """Configure the notifications settings to prefer the Brevo transport."""
+    from app.services import notifications
+
+    monkeypatch.setattr(notifications.settings, "NOTIFICATIONS_ENABLED", enabled)
+    monkeypatch.setattr(notifications.settings, "BREVO_API_KEY", "brevo-key-xyz")
+    monkeypatch.setattr(notifications.settings, "MAIL_FROM", "noreply@example.com")
+    monkeypatch.setattr(notifications.settings, "SMTP_HOST", None)
+
+
+def test_brevo_send_success_posts_to_brevo_api(monkeypatch):
+    """A Brevo 201 -> {status:sent, provider:brevo}; POST shape is correct."""
+    from app.services import notifications
+
+    _use_brevo(monkeypatch)
+
+    captured: dict = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured.update(url=url, headers=headers, json=json, timeout=timeout)
+        return _FakeResp(201)
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    result = notifications._send_email_now(_TO, "Subj", "Body")
+
+    assert result == {"status": "sent", "provider": "brevo"}
+    assert captured["url"] == "https://api.brevo.com/v3/smtp/email"
+    assert captured["headers"]["api-key"] == "brevo-key-xyz"
+    assert captured["json"]["sender"] == {"email": "noreply@example.com"}
+    assert captured["json"]["to"] == [{"email": _TO}]
+    assert captured["json"]["subject"] == "Subj"
+    assert captured["json"]["textContent"] == "Body"
+
+
+def test_send_email_uses_brevo_when_enabled(monkeypatch):
+    """send_email() (past its dry-run guard) routes through Brevo when enabled."""
+    from app.services import notifications
+
+    _use_brevo(monkeypatch, enabled=True)
+
+    posts: list[str] = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        posts.append(url)
+        return _FakeResp(201)
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    result = notifications.send_email(_TO, "s", "b")
+
+    assert result == {"status": "sent", "provider": "brevo"}
+    assert posts == ["https://api.brevo.com/v3/smtp/email"]
+
+
+def test_brevo_send_non_2xx_returns_error_without_raising(monkeypatch):
+    """A Brevo 400 -> {status:error} carrying the code; NEVER raises."""
+    from app.services import notifications
+
+    _use_brevo(monkeypatch)
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        return _FakeResp(400, text="Bad Request: invalid sender")
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    result = notifications._send_email_now(_TO, "s", "b")
+
+    assert result["status"] == "error"
+    assert "400" in result["detail"]
+
+
+def test_test_email_uses_brevo_transport(anon_client, monkeypatch):
+    """/internal/test-email delivers via Brevo when BREVO_API_KEY + MAIL_FROM set."""
+    from app.services import notifications
+
+    _set_secret(monkeypatch, _SECRET)
+    _use_brevo(monkeypatch)
+
+    posts: list[dict] = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        posts.append(json)
+        return _FakeResp(201)
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    resp = anon_client.post(
+        _TEST_EMAIL_ENDPOINT,
+        headers={"X-Cron-Secret": _SECRET},
+        json={"to": _TO},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "sent", "provider": "brevo"}
+    assert len(posts) == 1
+    assert posts[0]["to"] == [{"email": _TO}]
+
+
+def test_test_email_no_transport_is_service_unavailable(anon_client, monkeypatch):
+    """Neither BREVO_API_KEY nor SMTP_HOST set (MAIL_FROM present) -> 503."""
+    from app.services import notifications
+
+    _set_secret(monkeypatch, _SECRET)
+    monkeypatch.setattr(notifications.settings, "BREVO_API_KEY", None)
+    monkeypatch.setattr(notifications.settings, "SMTP_HOST", None)
+    monkeypatch.setattr(notifications.settings, "MAIL_FROM", "noreply@example.com")
+
+    resp = anon_client.post(
+        _TEST_EMAIL_ENDPOINT,
+        headers={"X-Cron-Secret": _SECRET},
+        json={"to": _TO},
+    )
+
+    assert resp.status_code == 503
