@@ -30,6 +30,9 @@ RUN pip install -r requirements.txt \
 
 # Application code + migration assets (alembic upgrade head runs on boot).
 COPY app ./app
+# Operational scripts (e.g. scripts.collab_reminder, imported by the internal
+# cron-trigger endpoint). Must be present so `from scripts import ...` resolves.
+COPY scripts ./scripts
 COPY migrations ./migrations
 COPY alembic.ini ./alembic.ini
 COPY entrypoint.sh ./entrypoint.sh

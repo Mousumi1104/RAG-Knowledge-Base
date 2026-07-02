@@ -22,7 +22,6 @@ from fastapi import APIRouter, Depends, Header, HTTPException, status
 from app.core.config import get_settings
 from app.database.session import SessionLocal
 from app.utils.logging import get_logger
-from scripts import collab_reminder
 
 logger = get_logger(__name__)
 
@@ -61,6 +60,10 @@ def run_collab_reminders() -> dict:
     :func:`scripts.collab_reminder.main`, and returns the summary dict as JSON.
     Honors ``NOTIFICATIONS_ENABLED`` (sends nothing while disabled).
     """
+    # Imported lazily so a problem in this ops script can never break web-app
+    # startup — only this one endpoint would fail, not the whole service.
+    from scripts import collab_reminder
+
     db = SessionLocal()
     try:
         summary = collab_reminder.main(db)
