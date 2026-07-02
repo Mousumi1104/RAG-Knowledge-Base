@@ -19,3 +19,8 @@ pytest
 pytest-asyncio
 
 pdfplumber
+
+# Push notifications (imported LAZILY inside notifications.send_fcm, so the
+# module still imports on hosts/tests where these are not installed).
+firebase-admin
+google-auth

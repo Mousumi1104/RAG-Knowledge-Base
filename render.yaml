@@ -68,6 +68,44 @@ services:
       - key: CORS_ORIGINS
         sync: false
 
+  # ---------------------------------------------------------------------------
+  # Collaboration-day reminder cron. Runs at 13:30 UTC (= 19:00 IST) daily — the
+  # evening BEFORE each collab day. Shares the SAME Postgres as the web service.
+  # Ships in DRY-RUN: NOTIFICATIONS_ENABLED="false" and all creds are sync:false,
+  # so it logs "[dry-run] ..." and writes NO ledger rows until secrets are set.
+  # ---------------------------------------------------------------------------
+  - type: cron
+    name: rag-collab-reminder
+    env: docker
+    rootDir: backend
+    dockerfilePath: ./Dockerfile
+    schedule: "30 13 * * *"
+    dockerCommand: python scripts/collab_reminder.py
+    plan: starter
+    autoDeploy: true
+    envVars:
+      # Same DB as the web service (set to the identical connection string).
+      - key: DATABASE_URL
+        sync: false
+      # Explicit dry-run: real sending stays OFF until this is flipped to "true".
+      - key: NOTIFICATIONS_ENABLED
+        value: "false"
+      # --- Notification secrets (set in dashboard / API; never committed) ------
+      - key: FIREBASE_CREDENTIALS_JSON
+        sync: false
+      - key: GOOGLE_APPLICATION_CREDENTIALS
+        sync: false
+      - key: MAIL_FROM
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        sync: false
+      - key: SMTP_USERNAME
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+
 databases:
   - name: rag-knowledge-base-db
     postgresMajorVersion: "16"

@@ -108,7 +108,7 @@ def create_app() -> FastAPI:
     # --- Router extension point -------------------------------------------
     # Feature routers are wired here as the modules become available. Search,
     # chat, and admin routers are added in later phases.
-    from app.api import admin, auth, chat, documents, employee, search
+    from app.api import admin, auth, chat, device, documents, employee, search
 
     app.include_router(auth.router)
     # Documents: public router (anonymous upload) + admin router (management).
@@ -117,6 +117,7 @@ def create_app() -> FastAPI:
     app.include_router(search.router)
     app.include_router(chat.router)
     app.include_router(employee.router)
+    app.include_router(device.router)
     app.include_router(admin.router)
 
     return app

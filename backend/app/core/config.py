@@ -128,6 +128,43 @@ class Settings(BaseSettings):
     # (rollout window); set it in Render to enforce. See EZ chat auth spec §2.
     EZ_CHAT_API_KEY: str | None = None
 
+    # --- Notifications (collaboration-day reminder job) -------------------
+    # ALL optional with safe defaults so existing boot/tests are unaffected.
+    #
+    # Master switch. When False (the DEFAULT), the reminder channels never
+    # contact Firebase or an SMTP server: send_fcm/send_email log a "[dry-run]"
+    # line and return {"status": "dry_run"} without importing firebase-admin or
+    # opening a socket. Real sending is only enabled when this is True AND the
+    # relevant credentials below are present.
+    NOTIFICATIONS_ENABLED: bool = False
+    # Firebase Cloud Messaging (push): supply EITHER the full service-account
+    # JSON as a string (FIREBASE_CREDENTIALS_JSON) OR a path to the JSON file
+    # (GOOGLE_APPLICATION_CREDENTIALS). Either one satisfies the creds check.
+    FIREBASE_CREDENTIALS_JSON: str | None = None
+    GOOGLE_APPLICATION_CREDENTIALS: str | None = None
+    # Email (SMTP) fallback channel.
+    MAIL_FROM: str | None = None
+    SMTP_HOST: str | None = None
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str | None = None
+    SMTP_PASSWORD: str | None = None
+    SMTP_USE_TLS: bool = True
+
+    @property
+    def fcm_ready(self) -> bool:
+        """True only when notifications are on AND a Firebase credential exists."""
+        return bool(
+            self.NOTIFICATIONS_ENABLED
+            and (self.FIREBASE_CREDENTIALS_JSON or self.GOOGLE_APPLICATION_CREDENTIALS)
+        )
+
+    @property
+    def email_ready(self) -> bool:
+        """True only when notifications are on AND minimal SMTP config exists."""
+        return bool(
+            self.NOTIFICATIONS_ENABLED and self.SMTP_HOST and self.MAIL_FROM
+        )
+
     @property
     def cloudinary_enabled(self) -> bool:
         """True only when all three Cloudinary credentials are configured."""
