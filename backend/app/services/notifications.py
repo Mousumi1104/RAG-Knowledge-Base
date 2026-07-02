@@ -114,20 +114,27 @@ def send_fcm(token: str, title: str, body: str, data: dict) -> dict:
         return {"status": "error", "detail": str(exc)}
 
 
-def send_email(to: str, subject: str, body: str) -> dict:
-    """Send a plain-text email over SMTP (dry-run unless enabled + creds present).
+def smtp_configured() -> bool:
+    """True when the minimal SMTP creds (host + from-address) are present.
+
+    Independent of ``NOTIFICATIONS_ENABLED`` — this only asks "could we open an
+    SMTP connection?", which the operator test-email endpoint uses to decide
+    between 503 (unconfigured) and an actual send attempt.
+    """
+    return bool(settings.SMTP_HOST and settings.MAIL_FROM)
+
+
+def _smtp_send(to: str, subject: str, body: str) -> dict:
+    """Low-level SMTP send: performs the actual smtplib delivery, never gated.
+
+    This does NOT check ``NOTIFICATIONS_ENABLED`` — it is the raw send used both
+    by :func:`send_email` (after its dry-run guard passes) and by the operator
+    test-email endpoint. Assumes SMTP creds are present (callers check).
 
     Returns:
-        ``{"status": "dry_run"}`` when gated off, ``{"status": "sent"}`` on a
-        successful real send, or ``{"status": "error", "detail": ...}`` on a
-        swallowed failure. Never raises.
+        ``{"status": "sent"}`` on success, or ``{"status": "error",
+        "detail": ...}`` on a swallowed failure. Never raises.
     """
-    if not settings.email_ready:
-        logger.info(
-            "[dry-run] email to=%r subject=%r body=%r", to, subject, body
-        )
-        return {"status": "dry_run"}
-
     try:
         import smtplib
         from email.message import EmailMessage
@@ -149,3 +156,20 @@ def send_email(to: str, subject: str, body: str) -> dict:
     except Exception as exc:  # noqa: BLE001 - a send failure must not abort the batch
         logger.error("email send failed to=%r: %s", to, exc)
         return {"status": "error", "detail": str(exc)}
+
+
+def send_email(to: str, subject: str, body: str) -> dict:
+    """Send a plain-text email over SMTP (dry-run unless enabled + creds present).
+
+    Returns:
+        ``{"status": "dry_run"}`` when gated off, ``{"status": "sent"}`` on a
+        successful real send, or ``{"status": "error", "detail": ...}`` on a
+        swallowed failure. Never raises.
+    """
+    if not settings.email_ready:
+        logger.info(
+            "[dry-run] email to=%r subject=%r body=%r", to, subject, body
+        )
+        return {"status": "dry_run"}
+
+    return _smtp_send(to, subject, body)

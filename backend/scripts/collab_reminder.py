@@ -1,8 +1,8 @@
 """Daily collaboration-day reminder job (runs the evening BEFORE the collab day).
 
-Cron schedule: 19:00 IST (13:30 UTC). For every ACTIVE employee whose next
-scheduled collaboration day is *tomorrow*, send exactly ONE reminder over ONE
-mutually-exclusive channel:
+Cron schedule: 19:00 IST (13:30 UTC). For every ACTIVE employee who has a
+scheduled collaboration day *tomorrow* (whether or not they are also in office
+today), send exactly ONE reminder over ONE mutually-exclusive channel:
 
 - FCM push if the employee has an ACTIVE registered device token, ELSE
 - email if the employee has an address on file, ELSE
@@ -149,22 +149,26 @@ def main(db) -> dict:
         # people, e.g. "Sneha Mondal" vs "Sneha Mondal (Intern)"); fall back to
         # the display name. The greeting below always uses emp.name (display).
         schedule_name = emp.schedule_name or emp.name
-        nxt = collaboration_service.next_collab_day(db, schedule_name, today)
-        if nxt is None or nxt.date != target:
+        # Remind EVERYONE in office tomorrow — look up the collab-day row on the
+        # target date directly (not merely the *next* upcoming day). This also
+        # reminds people who are also in office today; the old "next day ==
+        # tomorrow" test skipped them.
+        row = collaboration_service.collab_day_on(db, schedule_name, target)
+        if row is None:
             continue
 
         owner = emp.employee_id
-        if _reminder_exists(db, owner, nxt.date):
+        if _reminder_exists(db, owner, row.date):
             summary["skipped_dedup"] += 1
             logger.info(
                 "skip (already reminded): %s owner=%s date=%s",
                 emp.name,
                 owner,
-                nxt.date.isoformat(),
+                row.date.isoformat(),
             )
             continue
 
-        weekday_full = nxt.date.strftime("%A")
+        weekday_full = row.date.strftime("%A")
 
         # Mutually-exclusive channel selection: device token wins over email.
         token_row = _active_device_token(db, owner)
@@ -173,11 +177,11 @@ def main(db) -> dict:
             res = send_fcm(
                 token_row.token,
                 FCM_TITLE,
-                _fcm_body(weekday_full, nxt.date, nxt.room),
+                _fcm_body(weekday_full, row.date, row.room),
                 {
                     "type": "collab_reminder",
-                    "date": nxt.date.isoformat(),
-                    "room": nxt.room or "",
+                    "date": row.date.isoformat(),
+                    "room": row.room or "",
                 },
             )
         elif emp.email:
@@ -185,7 +189,7 @@ def main(db) -> dict:
             res = send_email(
                 emp.email,
                 EMAIL_SUBJECT,
-                _email_body(emp.name, weekday_full, nxt.date, nxt.room),
+                _email_body(emp.name, weekday_full, row.date, row.room),
             )
         else:
             summary["no_channel"] += 1
@@ -201,7 +205,7 @@ def main(db) -> dict:
             "reminder %s owner=%s date=%s channel=%s -> %s",
             emp.name,
             owner,
-            nxt.date.isoformat(),
+            row.date.isoformat(),
             channel,
             status,
         )
@@ -211,7 +215,7 @@ def main(db) -> dict:
             db.add(
                 ReminderSent(
                     owner=owner,
-                    collab_date=nxt.date,
+                    collab_date=row.date,
                     channel=channel,
                     status=Status.ACTIVE.value,
                 )
@@ -225,7 +229,7 @@ def main(db) -> dict:
                 logger.info(
                     "dedup race lost for owner=%s date=%s",
                     owner,
-                    nxt.date.isoformat(),
+                    row.date.isoformat(),
                 )
                 continue
             summary["sent_fcm" if channel == "fcm" else "sent_email"] += 1
@@ -237,7 +241,7 @@ def main(db) -> dict:
             logger.error(
                 "send error owner=%s date=%s channel=%s detail=%s",
                 owner,
-                nxt.date.isoformat(),
+                row.date.isoformat(),
                 channel,
                 res.get("detail"),
             )

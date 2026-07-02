@@ -11,6 +11,9 @@ Currently exposed:
   pass (see :mod:`scripts.collab_reminder`). The job already honors
   ``NOTIFICATIONS_ENABLED``, so this endpoint sends NOTHING while notifications
   are disabled; it simply reports the dry-run summary.
+- ``POST /internal/test-email`` — send ONE email to a specified address to
+  verify SMTP delivery. This EXPLICIT operator test bypasses
+  ``NOTIFICATIONS_ENABLED`` but still requires SMTP creds (else 503).
 """
 
 from __future__ import annotations
@@ -18,9 +21,11 @@ from __future__ import annotations
 import hmac
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
+from pydantic import BaseModel, EmailStr
 
 from app.core.config import get_settings
 from app.database.session import SessionLocal
+from app.services import notifications
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -71,3 +76,37 @@ def run_collab_reminders() -> dict:
         db.close()
     logger.info("run-collab-reminders triggered: %s", summary)
     return summary
+
+
+class TestEmailRequest(BaseModel):
+    """Body for the operator SMTP delivery test."""
+
+    to: EmailStr
+    name: str | None = None
+
+
+@router.post("/test-email", dependencies=[Depends(require_cron_secret)])
+def test_email(req: TestEmailRequest) -> dict:
+    """Send ONE test email to ``req.to`` to verify SMTP (Brevo) delivery.
+
+    Guarded by :func:`require_cron_secret`. This is an EXPLICIT operator test: it
+    bypasses the global ``NOTIFICATIONS_ENABLED`` switch (calling the low-level
+    :func:`notifications._smtp_send` directly) but still requires SMTP creds
+    (``SMTP_HOST`` + ``MAIL_FROM``) — without them it returns 503. It sends ONLY
+    to the single ``to`` address and returns the raw send result JSON.
+    """
+    if not notifications.smtp_configured():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="SMTP not configured (need SMTP_HOST + MAIL_FROM)",
+        )
+    result = notifications._smtp_send(
+        req.to,
+        subject="[TEST] Collab reminder email",
+        body=(
+            "This is a delivery test for the collaboration-day reminder system. "
+            "If you received this, SMTP is working."
+        ),
+    )
+    logger.info("test-email sent to=%r -> %s", req.to, result.get("status"))
+    return result

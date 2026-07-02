@@ -145,6 +145,53 @@ def test_channel_exclusivity_email_when_no_token(collab_setup, monkeypatch):
     assert args[1] == "Reminder: your Collaboration Day is tomorrow"
 
 
+def test_reminds_when_in_office_today_and_tomorrow(collab_setup, monkeypatch):
+    """In office BOTH today and tomorrow -> still reminded for tomorrow.
+
+    The old "next collab day == tomorrow" test skipped anyone whose *next* day
+    was today; the job now targets the tomorrow row directly, so this person is
+    reminded (and the message carries TOMORROW's date/room, not today's).
+    """
+    db = collab_setup  # already has a tomorrow row (Room 11); add a today row.
+    today = datetime.now(IST).date()
+    tomorrow = _target_date()
+    db.add(
+        CollaborationDay(
+            employee_name=_NAME,
+            date=today,
+            weekday="Tue",
+            ws="8",
+            room="Room 99",  # distinct from tomorrow's Room 11
+            status=Status.ACTIVE.value,
+        )
+    )
+    db.commit()
+
+    email_calls: list[tuple] = []
+    monkeypatch.setattr(
+        collab_reminder, "send_fcm", lambda *a, **k: {"status": "sent"},
+    )
+    monkeypatch.setattr(
+        collab_reminder, "send_email",
+        lambda *a, **k: email_calls.append((a, k)) or {"status": "sent"},
+    )
+
+    summary = collab_reminder.main(db)
+
+    assert summary["sent_email"] == 1
+    assert len(email_calls) == 1
+    body = email_calls[0][0][2]
+    # Reminder is for TOMORROW's row: Room 11, not today's Room 99.
+    assert "Room 11" in body
+    assert "Room 99" not in body
+    # Exactly one ledger row, keyed to tomorrow's date.
+    rows = db.execute(
+        select(ReminderSent).where(ReminderSent.owner == _OWNER)
+    ).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].collab_date == tomorrow
+
+
 def test_dedup_second_run_does_not_resend(collab_setup, monkeypatch):
     """The UNIQUE ledger blocks a second send: total sends across two runs == 1."""
     db = collab_setup
