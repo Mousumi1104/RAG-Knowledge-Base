@@ -3,7 +3,7 @@
 Two mutually-exclusive delivery channels are exposed:
 
 - :func:`send_fcm` — Firebase Cloud Messaging push (for logged-in mobile
-  devices that registered a token via ``/device/register``).
+  devices that registered a token via ``/employee/device/register``).
 - :func:`send_email` — a plain SMTP fallback for employees with no device.
 
 BOTH are DRY-RUN BY DEFAULT. Real sending only happens when

@@ -1,6 +1,7 @@
 """Tests for the Employee-Zone device-token + logout API.
 
-Exercises ``POST /device/register`` / ``/device/unregister`` / ``/logout`` against
+Exercises ``POST /employee/device/register`` / ``/employee/device/unregister`` /
+``/employee/logout`` against
 the local providers + Postgres test DB from ``conftest.py``. Identity is the
 Mode-A owner key (``X-Employee-Id`` header, falling back to the resolved email) --
 the SAME key the reminder job and chat-history stack use.
@@ -60,7 +61,7 @@ def test_register_upserts_single_row_by_owner(client, db) -> None:
     owner = _owner()
     try:
         resp = client.post(
-            "/device/register",
+            "/employee/device/register",
             json={"token": "tok-A", "platform": "ios"},
             headers=_headers(owner),
         )
@@ -79,7 +80,7 @@ def test_register_upserts_single_row_by_owner(client, db) -> None:
         # (UNIQUE owner upsert): still exactly one, with the new token + a bumped
         # updated_at.
         resp = client.post(
-            "/device/register",
+            "/employee/device/register",
             json={"token": "tok-B", "platform": "android"},
             headers=_headers(owner),
         )
@@ -103,7 +104,7 @@ def test_register_self_populates_employee_roster(client, db) -> None:
     name = "Roster Person"
     try:
         resp = client.post(
-            "/device/register",
+            "/employee/device/register",
             json={"token": "tok"},
             headers=_headers(owner, email=email, name=name),
         )
@@ -122,7 +123,7 @@ def test_register_self_populates_employee_roster(client, db) -> None:
         # the existing name (the null-overwrite guard). Email always resolves to
         # the Mode-A default when the header is absent, so only name is asserted.
         resp = client.post(
-            "/device/register", json={"token": "tok2"}, headers=_headers(owner)
+            "/employee/device/register", json={"token": "tok2"}, headers=_headers(owner)
         )
         assert resp.status_code == 200, resp.text
 
@@ -139,10 +140,10 @@ def test_unregister_soft_deletes_and_is_idempotent(client, db) -> None:
     owner = _owner()
     try:
         client.post(
-            "/device/register", json={"token": "tok"}, headers=_headers(owner)
+            "/employee/device/register", json={"token": "tok"}, headers=_headers(owner)
         )
 
-        resp = client.post("/device/unregister", json={}, headers=_headers(owner))
+        resp = client.post("/employee/device/unregister", json={}, headers=_headers(owner))
         assert resp.status_code == 200, resp.text
         assert resp.json()["status"] == "unregistered"
 
@@ -151,7 +152,7 @@ def test_unregister_soft_deletes_and_is_idempotent(client, db) -> None:
         assert rows[0].status == Status.DELETED.value
 
         # Idempotent: a second unregister is fine (still DELETED, still one row).
-        resp = client.post("/device/unregister", json={}, headers=_headers(owner))
+        resp = client.post("/employee/device/unregister", json={}, headers=_headers(owner))
         assert resp.status_code == 200, resp.text
         rows = _tokens(db, owner)
         assert len(rows) == 1
@@ -163,7 +164,7 @@ def test_unregister_soft_deletes_and_is_idempotent(client, db) -> None:
 def test_unregister_without_prior_token_is_ok(client, db) -> None:
     owner = _owner()
     try:
-        resp = client.post("/device/unregister", json={}, headers=_headers(owner))
+        resp = client.post("/employee/device/unregister", json={}, headers=_headers(owner))
         assert resp.status_code == 200, resp.text
         assert resp.json()["status"] == "unregistered"
         assert _tokens(db, owner) == []
@@ -175,10 +176,10 @@ def test_logout_clears_token(client, db) -> None:
     owner = _owner()
     try:
         client.post(
-            "/device/register", json={"token": "tok"}, headers=_headers(owner)
+            "/employee/device/register", json={"token": "tok"}, headers=_headers(owner)
         )
 
-        resp = client.post("/logout", headers=_headers(owner))
+        resp = client.post("/employee/logout", headers=_headers(owner))
         assert resp.status_code == 200, resp.text
         assert resp.json()["status"] == "logged_out"
 
@@ -190,20 +191,20 @@ def test_logout_clears_token(client, db) -> None:
 
 
 def test_api_key_gate_enforced_when_configured(client, db, monkeypatch) -> None:
-    """When EZ_CHAT_API_KEY is set, /device/* requires a matching X-API-Key."""
+    """When EZ_CHAT_API_KEY is set, /employee/device/* requires a matching X-API-Key."""
     owner = _owner()
     monkeypatch.setenv("EZ_CHAT_API_KEY", "s3cret-key")
     get_settings.cache_clear()
     try:
         # No key -> 401.
         resp = client.post(
-            "/device/register", json={"token": "tok"}, headers=_headers(owner)
+            "/employee/device/register", json={"token": "tok"}, headers=_headers(owner)
         )
         assert resp.status_code == 401, resp.text
 
         # Matching key -> allowed.
         headers = {**_headers(owner), "X-API-Key": "s3cret-key"}
-        resp = client.post("/device/register", json={"token": "tok"}, headers=headers)
+        resp = client.post("/employee/device/register", json={"token": "tok"}, headers=headers)
         assert resp.status_code == 200, resp.text
         assert _tokens(db, owner)[0].token == "tok"
     finally:

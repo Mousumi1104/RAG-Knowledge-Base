@@ -7,10 +7,11 @@ owner key is the SAME value the chat-history stack uses:
 header, falling back to the resolved employee email (Mode-A identity).
 
 Endpoints (all gated by :func:`require_api_key`, same as ``/employee/*``):
-- ``POST /device/register``   — upsert the caller's ``device_tokens`` row (UNIQUE
-  by owner) AND self-populate the ``employees`` roster row from the login.
-- ``POST /device/unregister`` — idempotent soft-delete of the caller's token row.
-- ``POST /logout``            — same server-side token clear as unregister.
+- ``POST /employee/device/register``   — upsert the caller's ``device_tokens`` row
+  (UNIQUE by owner) AND self-populate the ``employees`` roster row from the login.
+- ``POST /employee/device/unregister`` — idempotent soft-delete of the caller's
+  token row.
+- ``POST /employee/logout``            — same server-side token clear as unregister.
 
 There is intentionally no user/Bearer auth here: identity is the Employee-Zone
 owner key, not the users-table :func:`get_current_user`.
@@ -38,9 +39,11 @@ from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-# No prefix: paths are POST /device/register, /device/unregister and /logout.
+# Prefix "/employee": paths are POST /employee/device/register,
+# /employee/device/unregister and /employee/logout.
 # The shared EZ API-key gate applies to every route (same as /employee/*).
 router = APIRouter(
+    prefix="/employee",
     tags=["device"],
     dependencies=[Depends(require_api_key)],
 )
