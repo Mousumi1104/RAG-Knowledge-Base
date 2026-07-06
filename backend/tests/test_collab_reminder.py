@@ -114,7 +114,12 @@ def test_channel_exclusivity_fcm_when_token(collab_setup, monkeypatch):
     # FCM was called with the registered token + the collab-reminder data.
     args = fcm_calls[0][0]
     assert args[0] == "dtoken-abc"
-    assert args[1] == "Collab Day tomorrow"
+    assert args[1] == "Collaboration Day Reminder"
+    # The push body carries the new formal wording (mirrors the email, no weekday).
+    body = args[2]
+    assert "Please note that tomorrow," in body
+    assert "is your upcoming Collaboration Day" in body
+    assert "at least 15 minutes before the scheduled time" in body
     data = args[3]
     assert data["type"] == "collab_reminder"
     assert data["room"] == "Room 11"
@@ -142,7 +147,11 @@ def test_channel_exclusivity_email_when_no_token(collab_setup, monkeypatch):
     assert summary["sent_email"] == 1 and summary["sent_fcm"] == 0
     args = email_calls[0][0]
     assert args[0] == _EMAIL
-    assert args[1] == "Reminder: your Collaboration Day is tomorrow"
+    assert args[1] == "Reminder: Your Collaboration Day is tomorrow"
+    # The email body carries the new wording (no weekday).
+    body = args[2]
+    assert "Please note that tomorrow," in body
+    assert "is your upcoming Collaboration Day" in body
 
 
 def test_reminds_when_in_office_today_and_tomorrow(collab_setup, monkeypatch):

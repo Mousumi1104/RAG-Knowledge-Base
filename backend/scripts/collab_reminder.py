@@ -42,8 +42,8 @@ from app.utils.logging import get_logger  # noqa: E402
 
 logger = get_logger(__name__)
 
-FCM_TITLE = "Collab Day tomorrow"
-EMAIL_SUBJECT = "Reminder: your Collaboration Day is tomorrow"
+FCM_TITLE = "Collaboration Day Reminder"
+EMAIL_SUBJECT = "Reminder: Your Collaboration Day is tomorrow"
 
 
 def _room_label(room: str | None) -> str:
@@ -60,35 +60,30 @@ def _room_label(room: str | None) -> str:
     return f"Room {room}"
 
 
-def _fcm_date(d) -> str:
-    """Render a date as ``"3 Jul 2026"`` (no leading zero on the day)."""
+def _fmt_date(d) -> str:
+    """Render a date as ``"7 July 2026"`` (no leading zero on the day, full month)."""
     day = str(int(d.strftime("%d")))
-    return d.strftime(f"{day} %b %Y")
+    return d.strftime(f"{day} %B %Y")
 
 
-def _email_date(d) -> str:
-    """Render a date as ``"06 July 2026"`` (leading-zero day, full month)."""
-    return d.strftime("%d %B %Y")
-
-
-def _fcm_body(weekday_full: str, collab_date, room: str | None) -> str:
-    """Build the exact FCM body string."""
+def _fcm_body(collab_date, room: str | None) -> str:
+    """Build the exact FCM body string (no weekday)."""
     return (
-        f"You're in office tomorrow ({weekday_full}, {_fcm_date(collab_date)}) "
-        f"— {_room_label(room)}."
+        f"Please note that tomorrow, {_fmt_date(collab_date)}, is your upcoming "
+        f"Collaboration Day ({_room_label(room)}). Kindly ensure your presence "
+        "at least 15 minutes before the scheduled time."
     )
 
 
-def _email_body(name: str, weekday_full: str, collab_date, room: str | None) -> str:
-    """Build the exact email body (greeted by name) per the spec wording."""
+def _email_body(name: str, collab_date, room: str | None) -> str:
+    """Build the exact email body (greeted by name when present, no weekday)."""
     greeting = f"Dear {name},\n\n" if name else ""
     return (
         f"{greeting}"
-        "I hope this message finds you well. I want to take a moment to remind "
-        "you all about our upcoming Collaboration Day scheduled for "
-        f"{weekday_full} - {_email_date(collab_date)} ({_room_label(room)}). "
-        "Please ensure your presence at the office at least 15 minutes before "
-        "the scheduled time."
+        "I hope this message finds you well. Please note that tomorrow, "
+        f"{_fmt_date(collab_date)}, is your upcoming Collaboration Day, and you "
+        f"are scheduled to be in {_room_label(room)}. Kindly ensure your "
+        "presence at the office at least 15 minutes before the scheduled time."
     )
 
 
@@ -168,8 +163,6 @@ def main(db) -> dict:
             )
             continue
 
-        weekday_full = row.date.strftime("%A")
-
         # Mutually-exclusive channel selection: device token wins over email.
         token_row = _active_device_token(db, owner)
         if token_row is not None:
@@ -177,7 +170,7 @@ def main(db) -> dict:
             res = send_fcm(
                 token_row.token,
                 FCM_TITLE,
-                _fcm_body(weekday_full, row.date, row.room),
+                _fcm_body(row.date, row.room),
                 {
                     "type": "collab_reminder",
                     "date": row.date.isoformat(),
@@ -189,7 +182,7 @@ def main(db) -> dict:
             res = send_email(
                 emp.email,
                 EMAIL_SUBJECT,
-                _email_body(emp.name, weekday_full, row.date, row.room),
+                _email_body(emp.name, row.date, row.room),
             )
         else:
             summary["no_channel"] += 1
