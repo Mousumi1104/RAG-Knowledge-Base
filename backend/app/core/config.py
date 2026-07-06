@@ -165,9 +165,18 @@ class Settings(BaseSettings):
     @property
     def fcm_ready(self) -> bool:
         """True only when notifications are on AND a Firebase credential exists."""
+        return bool(self.NOTIFICATIONS_ENABLED and self.firebase_configured)
+
+    @property
+    def firebase_configured(self) -> bool:
+        """True when a Firebase credential is present (JSON string OR file path).
+
+        Independent of ``NOTIFICATIONS_ENABLED`` — this only asks "could we send
+        a push at all?", which the operator test-push endpoint uses to decide
+        between 503 (unconfigured) and an actual send attempt.
+        """
         return bool(
-            self.NOTIFICATIONS_ENABLED
-            and (self.FIREBASE_CREDENTIALS_JSON or self.GOOGLE_APPLICATION_CREDENTIALS)
+            self.FIREBASE_CREDENTIALS_JSON or self.GOOGLE_APPLICATION_CREDENTIALS
         )
 
     @property

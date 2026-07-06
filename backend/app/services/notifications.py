@@ -95,6 +95,40 @@ def send_fcm(token: str, title: str, body: str, data: dict) -> dict:
         )
         return {"status": "dry_run"}
 
+    return _fcm_send_now(token, title, body, payload)
+
+
+def firebase_configured() -> bool:
+    """True when a Firebase credential is present (regardless of enablement).
+
+    Independent of ``NOTIFICATIONS_ENABLED`` — this only asks "could we send a
+    push at all?", which the operator test-push endpoint uses to decide between
+    503 (unconfigured) and an actual send attempt. Delegates to the
+    :attr:`Settings.firebase_configured` property.
+    """
+    return bool(settings.firebase_configured)
+
+
+def _fcm_send_now(token: str, title: str, body: str, data: dict) -> dict:
+    """Really send an FCM push (never gated on ``NOTIFICATIONS_ENABLED``).
+
+    Performs the actual firebase-admin delivery. This does NOT check
+    ``settings.fcm_ready`` — it is the raw send used both by :func:`send_fcm`
+    (after its dry-run guard passes) and directly by the operator test-push
+    endpoint. Assumes a Firebase credential is present (callers check).
+
+    Args:
+        token: The recipient device's registration token.
+        title: Notification title.
+        body: Notification body.
+        data: Extra data payload; passed through as-is (callers coerce values
+            to strings and add the ``"type"`` marker).
+
+    Returns:
+        ``{"status": "sent", "id": ...}`` on a successful send, or
+        ``{"status": "error", "detail": ...}`` on a swallowed failure. Never
+        raises.
+    """
     try:
         import firebase_admin  # noqa: F401  (ensures the dep is importable)
         from firebase_admin import messaging
@@ -103,7 +137,7 @@ def send_fcm(token: str, title: str, body: str, data: dict) -> dict:
         message = messaging.Message(
             token=token,
             notification=messaging.Notification(title=title, body=body),
-            data=payload,
+            data=data,
             android=messaging.AndroidConfig(priority="high"),
         )
         message_id = messaging.send(message, app=app)

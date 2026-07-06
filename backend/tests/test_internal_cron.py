@@ -15,11 +15,16 @@ Gate matrix:
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 
 import pytest
+from sqlalchemy import delete
 
 from app.api import internal
+from app.database.base import Status
+from app.database.session import SessionLocal
+from app.models.device_token import DeviceToken
 from scripts import collab_reminder
 
 _ENDPOINT = "/internal/run-collab-reminders"
@@ -347,3 +352,157 @@ def test_test_email_no_transport_is_service_unavailable(anon_client, monkeypatch
     )
 
     assert resp.status_code == 503
+
+
+# ---------------------------------------------------------------------------
+# POST /internal/test-push — explicit operator FCM push delivery test.
+# ---------------------------------------------------------------------------
+_TEST_PUSH_ENDPOINT = "/internal/test-push"
+
+
+def _push_owner() -> str:
+    """A unique owner key per test (device_tokens isn't truncated per test)."""
+    return f"EMP-{uuid.uuid4().hex[:12]}"
+
+
+def _make_token(owner: str, token: str, *, status_value: int = Status.ACTIVE.value) -> None:
+    """Insert a device_tokens row for ``owner`` (cleaned up via ``_del_tokens``)."""
+    session = SessionLocal()
+    try:
+        session.add(
+            DeviceToken(owner=owner, token=token, platform="ios", status=status_value)
+        )
+        session.commit()
+    finally:
+        session.close()
+
+
+def _del_tokens(owner: str) -> None:
+    """Hard-delete the device_tokens rows created for ``owner``."""
+    session = SessionLocal()
+    try:
+        session.execute(delete(DeviceToken).where(DeviceToken.owner == owner))
+        session.commit()
+    finally:
+        session.close()
+
+
+def _stub_fcm(monkeypatch) -> list[tuple]:
+    """Replace _fcm_send_now with a stub recording (token, title, body, data)."""
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        internal.notifications,
+        "_fcm_send_now",
+        lambda token, title, body, data: calls.append((token, title, body, data))
+        or {"status": "sent", "id": "stub-id"},
+    )
+    return calls
+
+
+def test_test_push_sends_once_with_active_token_and_secret(anon_client, monkeypatch):
+    """Firebase configured + ACTIVE token + correct secret -> 200, sent once."""
+    _set_secret(monkeypatch, _SECRET)
+    monkeypatch.setattr(internal.notifications, "firebase_configured", lambda: True)
+    calls = _stub_fcm(monkeypatch)
+
+    owner = _push_owner()
+    _make_token(owner, "tok-active")
+    try:
+        resp = anon_client.post(
+            _TEST_PUSH_ENDPOINT,
+            headers={"X-Cron-Secret": _SECRET},
+            json={"owner": owner},
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "sent"
+        assert body["id"] == "stub-id"
+        assert body["owner"] == owner
+        assert len(calls) == 1
+        assert calls[0][0] == "tok-active"  # pushed to ONLY that token
+    finally:
+        _del_tokens(owner)
+
+
+def test_test_push_wrong_secret_is_unauthorized(anon_client, monkeypatch):
+    _set_secret(monkeypatch, _SECRET)
+    monkeypatch.setattr(internal.notifications, "firebase_configured", lambda: True)
+    calls = _stub_fcm(monkeypatch)
+
+    owner = _push_owner()
+    _make_token(owner, "tok-active")
+    try:
+        resp = anon_client.post(
+            _TEST_PUSH_ENDPOINT,
+            headers={"X-Cron-Secret": "nope"},
+            json={"owner": owner},
+        )
+        assert resp.status_code == 401
+        assert calls == []  # never sent
+    finally:
+        _del_tokens(owner)
+
+
+def test_test_push_missing_secret_is_unauthorized(anon_client, monkeypatch):
+    _set_secret(monkeypatch, _SECRET)
+    monkeypatch.setattr(internal.notifications, "firebase_configured", lambda: True)
+    calls = _stub_fcm(monkeypatch)
+
+    owner = _push_owner()
+    _make_token(owner, "tok-active")
+    try:
+        resp = anon_client.post(_TEST_PUSH_ENDPOINT, json={"owner": owner})
+        assert resp.status_code == 401
+        assert calls == []
+    finally:
+        _del_tokens(owner)
+
+
+def test_test_push_owner_without_active_token_is_not_found(anon_client, monkeypatch):
+    """A soft-deleted (DELETED) token is not 'active' -> 404, no send."""
+    _set_secret(monkeypatch, _SECRET)
+    monkeypatch.setattr(internal.notifications, "firebase_configured", lambda: True)
+    calls = _stub_fcm(monkeypatch)
+
+    owner = _push_owner()
+    _make_token(owner, "tok-deleted", status_value=Status.DELETED.value)
+    try:
+        resp = anon_client.post(
+            _TEST_PUSH_ENDPOINT,
+            headers={"X-Cron-Secret": _SECRET},
+            json={"owner": owner},
+        )
+        assert resp.status_code == 404
+        assert calls == []
+    finally:
+        _del_tokens(owner)
+
+
+def test_test_push_firebase_not_configured_is_service_unavailable(anon_client, monkeypatch):
+    """Active token present but Firebase creds absent -> 503, no send."""
+    _set_secret(monkeypatch, _SECRET)
+    monkeypatch.setattr(internal.notifications, "firebase_configured", lambda: False)
+    calls = _stub_fcm(monkeypatch)
+
+    owner = _push_owner()
+    _make_token(owner, "tok-active")
+    try:
+        resp = anon_client.post(
+            _TEST_PUSH_ENDPOINT,
+            headers={"X-Cron-Secret": _SECRET},
+            json={"owner": owner},
+        )
+        assert resp.status_code == 503
+        assert calls == []  # firebase check short-circuits before any send
+    finally:
+        _del_tokens(owner)
+
+
+def test_send_fcm_dry_run_path_unaffected():
+    """send_fcm() still dry-runs (never touches _fcm_send_now) when fcm_ready False."""
+    from app.services import notifications
+
+    # Default test config has NOTIFICATIONS_ENABLED False -> fcm_ready False.
+    assert notifications.settings.fcm_ready is False
+    assert notifications.send_fcm("tok", "t", "b", {"k": "v"}) == {"status": "dry_run"}

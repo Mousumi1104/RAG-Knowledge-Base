@@ -14,6 +14,9 @@ Currently exposed:
 - ``POST /internal/test-email`` — send ONE email to a specified address to
   verify email delivery (Brevo HTTP API or SMTP). This EXPLICIT operator test
   bypasses ``NOTIFICATIONS_ENABLED`` but still requires email creds (else 503).
+- ``POST /internal/test-push`` — send ONE FCM push to a single owner's active
+  device token to verify push delivery. This EXPLICIT operator test bypasses
+  ``NOTIFICATIONS_ENABLED`` but still requires Firebase creds (else 503).
 """
 
 from __future__ import annotations
@@ -22,9 +25,12 @@ import hmac
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, EmailStr
+from sqlalchemy import select
 
 from app.core.config import get_settings
+from app.database.base import Status
 from app.database.session import SessionLocal
+from app.models.device_token import DeviceToken
 from app.services import notifications
 from app.utils.logging import get_logger
 
@@ -111,3 +117,80 @@ def test_email(req: TestEmailRequest) -> dict:
     )
     logger.info("test-email sent to=%r -> %s", req.to, result.get("status"))
     return result
+
+
+class TestPushRequest(BaseModel):
+    """Body for the operator FCM push delivery test.
+
+    ``owner`` optionally targets a specific device-token owner. When omitted, the
+    endpoint auto-resolves the target only if EXACTLY ONE active device token
+    exists (otherwise it 400s, refusing to guess among several).
+    """
+
+    owner: str | None = None
+
+
+@router.post("/test-push", dependencies=[Depends(require_cron_secret)])
+def test_push(req: TestPushRequest) -> dict:
+    """Send ONE test FCM push to a single owner's active device token.
+
+    Guarded by :func:`require_cron_secret`. This is an EXPLICIT operator test: it
+    bypasses the global ``NOTIFICATIONS_ENABLED`` switch (calling the low-level
+    :func:`notifications._fcm_send_now` directly) but still requires Firebase
+    creds — without them it returns 503.
+
+    Target resolution:
+    - If ``owner`` is given, that owner is used.
+    - Else if EXACTLY ONE active device token exists, its owner is used.
+    - Otherwise -> 400 ("specify owner").
+
+    The resolved owner must have an ACTIVE ``device_tokens`` row (else 404). The
+    push goes to ONLY that single token. Returns the raw send result plus the
+    resolved ``owner``.
+    """
+    db = SessionLocal()
+    try:
+        owner = req.owner
+        if not owner:
+            active_owners = list(
+                db.execute(
+                    select(DeviceToken.owner).where(
+                        DeviceToken.status == Status.ACTIVE.value
+                    )
+                ).scalars()
+            )
+            if len(active_owners) != 1:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="specify owner",
+                )
+            owner = active_owners[0]
+
+        row = db.execute(
+            select(DeviceToken).where(
+                DeviceToken.owner == owner,
+                DeviceToken.status == Status.ACTIVE.value,
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="no active device token for owner",
+            )
+
+        if not notifications.firebase_configured():
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="firebase not configured (need FIREBASE_CREDENTIALS_JSON or GOOGLE_APPLICATION_CREDENTIALS)",
+            )
+
+        result = notifications._fcm_send_now(
+            row.token,
+            title="[TEST] Collab reminder push",
+            body="This is a delivery test for the collaboration-day reminder push.",
+            data={"test": "1"},
+        )
+    finally:
+        db.close()
+    logger.info("test-push sent owner=%r -> %s", owner, result.get("status"))
+    return {**result, "owner": owner}
