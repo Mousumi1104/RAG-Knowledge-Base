@@ -67,6 +67,12 @@ services:
         sync: false
       - key: CORS_ORIGINS
         sync: false
+      # Shared secret gating POST /internal/sync-global-doc — the HR-admin
+      # portal (controllers/Handbook.php) sends it as X-Service-Token to push
+      # the HR Handbook PDF into the global KB. Must equal the admin app's
+      # rag_sync_token (RAG_HANDBOOK_SYNC_TOKEN). Empty => endpoint 503.
+      - key: HANDBOOK_SYNC_TOKEN
+        sync: false
 
   # ---------------------------------------------------------------------------
   # Scheduling moved to GitHub Actions -> POST /internal/run-collab-reminders

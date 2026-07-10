@@ -80,6 +80,7 @@ def create_document(
     uploaded_by: str | None = "admin",
     owner_id: int | None = None,
     is_global: bool = False,
+    external_ref: str | None = None,
 ) -> Document:
     """Validate, store, and create a new document row (status ACTIVE, pending).
 
@@ -87,6 +88,10 @@ def create_document(
     ``owner_id=<user id>, is_global=False``; an admin global upload passes
     ``owner_id=None, is_global=True``. These are set server-side from the
     authenticated identity and are never client-controlled.
+
+    ``external_ref`` tags a synced global doc with a stable external identity
+    (e.g. ``"hr_handbook"``) so a later re-upload can replace it; NULL for
+    ordinary uploads.
     """
     doc_type = validate_upload(filename, len(upload_file_bytes))
     stored_location, safe_name = _store_bytes(upload_file_bytes, filename)
@@ -97,6 +102,7 @@ def create_document(
         uploaded_by=uploaded_by or "admin",
         owner_id=owner_id,
         is_global=is_global,
+        external_ref=external_ref,
         file_path=stored_location,
         size=len(upload_file_bytes),
         indexing_status="pending",
@@ -109,6 +115,22 @@ def create_document(
     db.refresh(document)
     logger.info("Created document id=%s filename=%s", document.id, safe_name)
     return document
+
+
+def list_active_globals_by_ref(db: Session, external_ref: str) -> list[Document]:
+    """Return ACTIVE admin-global documents tagged with ``external_ref``.
+
+    Used by the handbook-sync bridge to locate the prior copy of a synced global
+    doc so it can be soft-deleted before the new upload is indexed. Normally
+    returns 0 or 1 rows; more than one only if a previous replace was interrupted
+    mid-flight, in which case the caller soft-deletes them all.
+    """
+    stmt = select(Document).where(
+        Document.status == Status.ACTIVE.value,
+        Document.is_global.is_(True),
+        Document.external_ref == external_ref,
+    )
+    return list(db.execute(stmt).scalars().all())
 
 
 def list_documents(

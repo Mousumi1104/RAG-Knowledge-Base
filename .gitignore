@@ -20,6 +20,14 @@ frontend/tsconfig.tsbuildinfo
 backend/uploads/
 **/uploads/
 
+# Firebase service-account keys (secret) — NEVER commit to this public repo.
+**/*firebase-adminsdk*.json
+backend/ezapp-*.json
+
+# Large local build/deploy archives (not source).
+render.zip
+*.zip
+
 # OS / editor cruft
 .DS_Store
 

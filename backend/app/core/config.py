@@ -142,6 +142,13 @@ class Settings(BaseSettings):
     # disabled (503) so the job can never be triggered without an explicit
     # secret. Set it in Render AND as the CRON_SECRET GitHub Actions secret.
     CRON_SECRET: str | None = None
+    # Shared secret gating the server-to-server global-document sync endpoint
+    # (POST /internal/sync-global-doc), used by the HR-admin portal to push the
+    # HR Handbook PDF into the RAG global knowledge base whenever it is updated.
+    # When None/empty the endpoint is disabled (503) so it can never be triggered
+    # without an explicit secret. Kept SEPARATE from CRON_SECRET (least
+    # privilege): the admin portal gets only handbook-sync rights, not cron.
+    HANDBOOK_SYNC_TOKEN: str | None = None
     # Firebase Cloud Messaging (push): supply EITHER the full service-account
     # JSON as a string (FIREBASE_CREDENTIALS_JSON) OR a path to the JSON file
     # (GOOGLE_APPLICATION_CREDENTIALS). Either one satisfies the creds check.

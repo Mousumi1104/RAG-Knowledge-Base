@@ -35,6 +35,11 @@ class Document(Base, TimestampStatusMixin):
     is_global: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=false()
     )
+    # Stable external identity for a synced global doc (e.g. ``"hr_handbook"``).
+    # NULL for ordinary user/admin uploads. The HR-admin portal's handbook-sync
+    # bridge sets this so a re-upload can REPLACE the prior copy under the same
+    # ref (soft-delete old + upload new) instead of piling up duplicate globals.
+    external_ref: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     file_path: Mapped[str] = mapped_column(String(1024), nullable=False)
     size: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     indexing_status: Mapped[str] = mapped_column(

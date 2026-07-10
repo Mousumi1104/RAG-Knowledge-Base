@@ -23,7 +23,17 @@ from __future__ import annotations
 
 import hmac
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    UploadFile,
+    status,
+)
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import select
 
@@ -31,7 +41,7 @@ from app.core.config import get_settings
 from app.database.base import Status
 from app.database.session import SessionLocal
 from app.models.device_token import DeviceToken
-from app.services import notifications
+from app.services import document_service, notifications
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -39,6 +49,32 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/internal", tags=["internal"])
 
 _HEADER_CRON_SECRET = "X-Cron-Secret"
+_HEADER_SERVICE_TOKEN = "X-Service-Token"
+
+
+def require_service_token(
+    x_service_token: str | None = Header(default=None, alias=_HEADER_SERVICE_TOKEN),
+) -> None:
+    """Gate the handbook-sync route with the shared service token (constant-time).
+
+    - If ``HANDBOOK_SYNC_TOKEN`` is unset/empty the endpoint is DISABLED (503):
+      the HR-admin portal can never push a doc without an explicit secret.
+    - Otherwise a missing or mismatched ``X-Service-Token`` header -> 401.
+
+    Deliberately a separate secret from ``CRON_SECRET`` (least privilege): the
+    admin portal holds only handbook-sync rights, not cron-trigger rights.
+    """
+    expected = get_settings().HANDBOOK_SYNC_TOKEN
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="handbook sync not configured",
+        )
+    if not x_service_token or not hmac.compare_digest(x_service_token, expected):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="invalid or missing service token",
+        )
 
 
 def require_cron_secret(
@@ -194,3 +230,53 @@ def test_push(req: TestPushRequest) -> dict:
         db.close()
     logger.info("test-push sent owner=%r -> %s", owner, result.get("status"))
     return {**result, "owner": owner}
+
+
+@router.post("/sync-global-doc", dependencies=[Depends(require_service_token)])
+async def sync_global_doc(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    ref: str = Form("hr_handbook"),
+) -> dict:
+    """Replace-by-ref upsert of a synced admin-global document.
+
+    The server-to-server bridge used by the HR-admin portal
+    (``application/controllers/Handbook.php``): whenever HR updates the HR
+    Handbook, the portal POSTs the PDF here so the RAG global knowledge base —
+    which grounds every Employee-Zone chatbot answer — stays in sync.
+
+    Guarded by :func:`require_service_token`. "Replace old" semantics: every
+    ACTIVE global doc already tagged with ``ref`` is soft-deleted (its vectors
+    dropped) BEFORE the new upload is created and indexed, so exactly one live
+    copy of the handbook exists and duplicate-PDF answers can't accumulate. The
+    new doc is created ``is_global=True, owner_id=None, external_ref=ref`` and
+    indexed in the background. Returns the replaced ids and the new doc id.
+    """
+    contents = await file.read()
+
+    db = SessionLocal()
+    try:
+        replaced = document_service.list_active_globals_by_ref(db, ref)
+        replaced_ids = [doc.id for doc in replaced]
+        for doc in replaced:
+            document_service.soft_delete_document(db, doc.id, owner_id=None)
+
+        document = document_service.create_document(
+            db,
+            upload_file_bytes=contents,
+            filename=file.filename or "handbook.pdf",
+            uploaded_by="hr-admin-portal",
+            owner_id=None,
+            is_global=True,
+            external_ref=ref,
+        )
+        new_id = document.id
+    finally:
+        db.close()
+
+    # Index AFTER the response is sent, in a fresh session (see documents.py).
+    from app.api.documents import _run_indexing_bg
+
+    background_tasks.add_task(_run_indexing_bg, new_id)
+    logger.info("sync-global-doc ref=%r new_id=%s replaced=%s", ref, new_id, replaced_ids)
+    return {"status": "ok", "ref": ref, "id": new_id, "replaced": replaced_ids}
