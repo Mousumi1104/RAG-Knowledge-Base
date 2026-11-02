@@ -37,3 +37,14 @@ render.zip
 # CI workflow excluded from pushes: deploy PAT lacks the `workflow` scope.
 # Restore manually or via a token with `workflow` scope.
 .github/workflows/
+
+# Local scratch / ops artefacts — contain DB URLs, dumps and logs. Never commit.
+scratchpad/
+backend/scripts/*.log
+backend/scripts/*_result.json
+
+# Unrelated PHP/CodeIgniter work kept in this folder — contains real DB
+# passwords and Brevo API keys. Never commit.
+quote.php
+sendemail.php
+Codeigniter API/

@@ -34,10 +34,32 @@ _OWNER = "TESTOWNER_REMINDER"
 _NAME = "Reminder Test Person"
 _EMAIL = "reminder.test.person@example.com"
 
-_SAMPLE_ROSTER = Path(
-    "/tmp/claude-1000/-mnt-d-RAG-Chatbot/"
-    "3101a9d4-d6b1-4aa3-a174-b15e23237f1b/scratchpad/employees_seed.json"
-)
+def _write_sample_roster(tmp_path: Path) -> Path:
+    """Write a synthetic 22-row roster (two 'Sneha Mondal' on distinct ids)."""
+    import json
+
+    rows = [
+        {
+            "employee_id": f"TESTSEED{i:03d}",
+            "name": f"Seed Test Person {i}",
+            "email": f"seed.test.{i}@example.com",
+        }
+        for i in range(1, 21)
+    ]
+    rows.append(
+        {"employee_id": "TESTSEED021", "name": "Sneha Mondal", "email": "sneha.a@example.com"}
+    )
+    rows.append(
+        {
+            "employee_id": "TESTSEED022",
+            "name": "Sneha Mondal",
+            "email": "sneha.b@example.com",
+            "schedule_name": "Sneha Mondal (Intern)",
+        }
+    )
+    path = tmp_path / "employees_seed.json"
+    path.write_text(json.dumps(rows), encoding="utf-8")
+    return path
 
 
 def _target_date():
@@ -375,13 +397,13 @@ def test_schedule_name_alias_disambiguates_same_display_name(db, monkeypatch):
         _cleanup_sneha(db)
 
 
-def test_seed_employees_upserts_and_is_idempotent(db):
+def test_seed_employees_upserts_and_is_idempotent(db, tmp_path):
     """Seed the 22-row sample roster; re-run updates (idempotent) not inserts."""
-    assert _SAMPLE_ROSTER.exists(), f"sample roster missing: {_SAMPLE_ROSTER}"
+    roster_path = _write_sample_roster(tmp_path)
 
     import json
 
-    roster = json.loads(_SAMPLE_ROSTER.read_text(encoding="utf-8"))
+    roster = json.loads(roster_path.read_text(encoding="utf-8"))
     ids = [r["employee_id"] for r in roster]
     assert len(ids) == 22
     assert len(set(ids)) == 22  # includes two 'Sneha Mondal' on distinct ids
@@ -391,7 +413,7 @@ def test_seed_employees_upserts_and_is_idempotent(db):
     db.commit()
 
     try:
-        inserted, updated = seed_employees.run(str(_SAMPLE_ROSTER))
+        inserted, updated = seed_employees.run(str(roster_path))
         assert (inserted, updated) == (22, 0)
 
         count = len(
@@ -402,7 +424,7 @@ def test_seed_employees_upserts_and_is_idempotent(db):
         assert count == 22
 
         # Re-run: fully idempotent (all updates, no new inserts).
-        inserted2, updated2 = seed_employees.run(str(_SAMPLE_ROSTER))
+        inserted2, updated2 = seed_employees.run(str(roster_path))
         assert (inserted2, updated2) == (0, 22)
         count2 = len(
             db.execute(

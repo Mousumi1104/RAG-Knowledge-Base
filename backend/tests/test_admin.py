@@ -40,7 +40,11 @@ def test_admin_stats_excludes_deleted(client) -> None:
     assert after["total_documents"] == 1
     assert after["indexed"] == 1
     # The remaining doc's chunks are still counted; the deleted doc's are not.
-    assert after["total_chunks"] == keep["chunk_count"]
+    # Indexing runs as a background task, so the upload response still reports
+    # chunk_count=0 — re-fetch the document for its post-indexing count.
+    keep_chunks = client.get(f"/documents/{keep['id']}").json()["chunk_count"]
+    assert keep_chunks > 0
+    assert after["total_chunks"] == keep_chunks
 
 
 def test_admin_indexing_status(client) -> None:
